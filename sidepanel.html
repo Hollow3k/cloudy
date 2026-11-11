@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cloudy</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <main>
+      <header class="brand">
+        <img src="icons/icon128.png" alt="" width="44" height="44" />
+        <h1>Cloudy</h1>
+      </header>
+
+      <form id="prompt-form">
+        <label for="prompt-input">Prompt</label>
+        <textarea id="prompt-input" rows="4" placeholder="Try: say ready"></textarea>
+        <p class="hint">Enter sends. Shift+Enter adds a new line.</p>
+
+        <div class="buttons">
+          <button type="submit" id="send-button">Send</button>
+          <button type="button" id="stop-button" disabled>Stop</button>
+        </div>
+      </form>
+
+      <p id="status" role="status" aria-live="polite">Ready.</p>
+
+      <h2>Reply</h2>
+      <pre id="reply" aria-live="polite"></pre>
+
+      <p class="note">
+        Stop cancels the browser's request. It does not prove Ollama stopped
+        computing; the server may finish the current generation on its own.
+      </p>
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
