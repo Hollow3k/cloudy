@@ -150,25 +150,36 @@ separate from the page-address rule above.
 ### Checking the answer
 
 The model is asked (via Ollama structured output) for
-`{"status": "answered" | "insufficient_evidence", "answer": ..., "citations": [ids]}`. A reply that is not
-valid JSON, lacks those fields, or has any other `status` is rejected with a clear message and shown
-unverified, with no sources. The answer is shown as plain text.
+`{"status": "answered" | "insufficient_evidence", "entries": [ids], "citations": [ids], "answer": "..."}`
+(keys in that order, so it decides what it lists and cites before it writes the text). A reply that is not valid
+JSON, lacks those fields, has any other `status`, or names more than 1000 IDs is rejected with a clear message
+and shown unverified, with no sources. The answer text is shown as plain text.
 
-Every cited ID is looked up **exactly** in the stored snapshot, whatever the status. The Sources section shows
-the label and destination from that stored data only, with a Copy button (destinations are text, never
-clickable links). IDs that are malformed, from an older snapshot, nonexistent, or not part of what the model
-was shown get a warning and no destination. URLs written by the model are never used.
+- **`entries`** are the exact items you asked to see (headings, links, controls). The panel draws each one
+  from the capture under "Listed entries": its real text, its real heading level (the `h1`-`h6` of the
+  element, not the number in its ID) and its stored destination, in the model's order. The answer text above
+  them is only a short lead-in written by the model. If the two disagree, trust the entries.
+- **`citations`** are the few IDs that support what the answer says (asked for: at most 5, not every entry the
+  model can see). They appear as ordinary cards under "Cited sources".
+- **Every ID in both lists is checked** against the snapshot the answer was based on, however many there are,
+  including duplicates. Only drawing is capped (40 listed entries, 20 other cards, 20 problem lines); anything not
+  drawn is counted on screen and was still checked. A reply may name at most 1000 IDs.
+- Malformed, bracketed, wrong-snapshot, nonexistent and never-shown IDs each get a warning and no destination.
+  A whole snapshot line (`s3:H2 | h2: ...`) is read by its leading ID only; the text after the bar is ignored.
+  URLs written by the model are never used.
 
-What the status changes (only when nothing is cited):
+What the status changes (only when nothing is named):
 
-- `insufficient_evidence` with no citations: a neutral "Not enough captured information" status and the
+- `insufficient_evidence` with nothing named: a neutral "Not enough captured information" status and the
   answer, with no missing-citation warning.
-- `answered` with no citations: a visible note that the answer cites no captured evidence, and no source cards.
-- Citations present: source cards as usual, with any invalid IDs warned.
+- `answered` with nothing named: a visible note that the answer cites no captured evidence, and no source cards.
+- Anything named: it is checked as above, whatever the status.
 
-The status is the model's own choice, not proof that an answer is accurate or that it was genuinely unable to
-answer, and a source card only shows that an ID exists in the capture, not that the answer uses it correctly.
-Compare the answer with "Show exactly what was captured".
+A valid ID shows only that the item exists in the capture and what it contains. It is **not** a check that the
+answer uses it correctly, and the status line never says "verified". For a summary, check the coverage line and
+compare the answer with "Show exactly what was captured". When the capture is partial (text cut off, headings,
+links or navigation not shown, scan limit reached), the status line says so with the real counts, whatever the
+model wrote.
 
 ### Limits
 
@@ -184,10 +195,11 @@ Compare the answer with "Show exactly what was captured".
   count after each page question and warns near 4096. Cloudy does not change Ollama's context size
   (`num_ctx`); measure memory and speed before raising it.
 - Counts and wording: the instructions tell the model to obey a limit in the question ("at most N", "exactly N")
-  over the general rule to list everything, never to pad to reach a count, to copy captured text exactly, and
-  to keep each heading's level. Local-model runs follow count limits reliably but sometimes get a heading
-  level or the answer format wrong, so compare the answer with the Sources cards, which show the level and
-  text straight from the capture.- Page content is untrusted. The instructions tell the model to use only the snapshot, ignore instructions
+  over the general rule to list everything, never to pad to reach a count, to copy quoted text exactly, and to
+  put listed items in `entries` so the panel can draw them from the capture. A small local model follows count
+  limits reliably, but it may still retype a heading or its level in its own lead-in text, which is why the
+  listed entries, not the lead-in, are the thing to read.
+- Page content is untrusted. The instructions tell the model to use only the snapshot, ignore instructions
   inside it, not to infer appearance, and to admit missing or truncated information, which helps but is not a
   guarantee. The feature has no way to act on a page.
 - Visible text can still contain personal information, and the title and URL path can too. It goes only to
@@ -215,6 +227,7 @@ node tests/make-fixtures.js     # writes HTML fixtures to tests/.out/
 node tests/dump-captures.js     # runs the real capture.js in headless Chrome on each fixture
 node tests/capture.test.js      # extractor checks (real Chrome, rendered DOM)
 node tests/panel.test.js        # panel logic with a fake chrome API, fetch and DOM
+node tests/pipeline.test.js     # a fake model reply -> parsing -> ID checking -> what is drawn
 node tests/model.test.js ref_contents_main 5   # asks the local model; reports a pass rate
 node tests/dump-captures.js <url> <name>       # capture a live page, then: node tests/model.test.js <name> 5
 ```

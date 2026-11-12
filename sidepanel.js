@@ -21,20 +21,32 @@ const LINKS_SHARE = 0.3; // ... for the links section (destinations included)
 const CONTROLS_SHARE = 0.1; // ... for buttons and form controls
 const NAV_SHARE = 0.1; // ... for site navigation links outside the main content
 const MAX_URL_CHARS = 400; // longer destinations are marked unavailable, never cut
-const MAX_CITED = 20; // most evidence IDs the panel will check per answer
+// Every ID a reply names is checked against the capture. These limits only bound
+// what a malformed reply can make the panel do, and how much is DRAWN. Nothing
+// here ever skips a check.
+const MAX_REPLY_IDS = 1000; // a reply naming more IDs than this is rejected (a capture holds far fewer)
+const MAX_LISTED_SHOWN = 40; // listed entries drawn (a capture holds at most 40 headings, 60 links...)
+const MAX_SOURCE_CARDS = 20; // other cited sources drawn; the rest are counted, not drawn
+const MAX_PROBLEM_LINES = 20; // problem lines drawn; the rest are counted, not drawn
 const CONTEXT_WARN_TOKENS = 3500; // warn when the prompt nears a 4096-token context
 // ----------------------------------------------------------------------------
 
 // What we ask Ollama to return in page mode (structured output).
 const REPLY_STATUSES = ["answered", "insufficient_evidence"];
+// "entries" = IDs of the exact items the user asked to see (headings, links,
+// labels). The panel draws those from the capture, so their text, levels and
+// destinations cannot be mistyped by the model. "citations" = the few IDs that
+// support what the answer says. Keys are generated in this order, so the model
+// decides what it lists and what supports it BEFORE it writes the answer text.
 const REPLY_SCHEMA = {
   type: "object",
   properties: {
     status: { type: "string", enum: REPLY_STATUSES },
-    answer: { type: "string" },
+    entries: { type: "array", items: { type: "string" } },
     citations: { type: "array", items: { type: "string" } },
+    answer: { type: "string" },
   },
-  required: ["status", "answer", "citations"],
+  required: ["status", "entries", "citations", "answer"],
   additionalProperties: false,
 };
 
@@ -46,14 +58,18 @@ const PAGE_SYSTEM_PROMPT = [
   "- The SELECTION note says which part of the page the text, headings, links and controls come from, and that this choice is a heuristic that can be wrong. NAVIGATION LINKS are site menus, banner and footer links outside the main content: do not present them as part of the page's article or main content. If a question may concern a part the SELECTION note says was left out, say so.",
   "- You cannot see layout, colors, fonts, size, images or any appearance. Do not infer them; say they are not in the snapshot.",
   "- If the snapshot does not contain the answer, or the relevant part was omitted or cut off, say so. Do not guess.",
-  "- Counts and limits: if the question states a number or limit (for example at most N, exactly N, first N, one, two), follow it literally. It overrides every completeness rule below. \"At most N\" means N or fewer. \"Exactly N\" means N only if the snapshot supports N items; if fewer are available, give only those and say how many there are. Never invent, pad or repeat items to reach a count, never list more than the limit, and cite only the items you actually list.",
-  "- If the question states no limit and asks for a list (all headings, all links, all languages...), check EVERY captured entry and text in the relevant sections and include every match. If entries may be missing because of OMITTED or CUT OFF notes, say so.",
-  "- Quoting: when you give a heading, link label, control label or other captured text, copy it exactly as written in the snapshot, character for character, including symbols and angle brackets such as <h1>. Never shorten, reword, translate or drop part of it. Give each heading's level exactly as shown in its own entry (h1-h6) and keep snapshot order.",
+  "- Counts and limits: if the question states a number or limit (for example at most N, exactly N, first N, one, two), follow it literally. It overrides every completeness rule below. \"At most N\" means N or fewer. \"Exactly N\" means N only if the snapshot supports N items; if fewer are available, give only those and say how many there are. Never invent, pad or repeat items to reach a count, never list more than the limit, and name only the items you actually list.",
+  "- If the question states no limit and asks for a list (all headings, all links, all languages...), check EVERY captured entry and text in the relevant sections and list every match. If entries may be missing because of OMITTED or CUT OFF notes, say so.",
+  "- Listing exact items: when the user asks you to list, quote or give specific headings, links, navigation links or controls, the panel shows those items straight from the capture (see \"entries\" below), so your \"answer\" is only a short lead-in that names no heading text, no h1-h6 levels and no URLs (for example: \"Here are the first two headings.\" or \"There are 18 headings; these 3 are shown.\"). The counts and limits rule applies to what you put in \"entries\".",
+  "- Quoting: when your answer text quotes captured text, copy it exactly as written in the snapshot, character for character, including symbols and angle brackets such as <h1>. Never shorten, reword or translate a quotation.",
+  "- Summaries and explanations: use only what the snapshot supports. The snapshot is partial: if it says TEXT CUT OFF or OMITTED, or the SELECTION note says content was left out, say plainly that your summary covers only the captured part. Never claim to describe the whole page.",
   "- When you list items from a section that ends with an OMITTED or MORE MAY EXIST note, add one short sentence saying that more entries exist but are not shown, unless the user asked for fewer items than are shown.",
-  '- Evidence IDs belong in "citations", not in the wording of "answer". The number inside an ID (the 3 in H3) is only a counter and is NOT the heading level: the level of a heading is the hN written after the bar in its own entry. "citations" must be exactly the entries your answer uses.',
+  '- Evidence IDs belong only in "entries" and "citations", never in the wording of "answer". The number inside an ID (the 3 in H3) is only a counter and is NOT the heading level.',
   "- Link destinations appear only in the LINKS section. Never write a URL that is not in the snapshot. A destination marked withheld, excluded or unavailable must not be guessed.",
-  '- Reply with JSON only, in this shape: {"status": "answered" or "insufficient_evidence", "answer": string, "citations": string[]}. Use "insufficient_evidence" when the snapshot does not contain what is needed to answer, including when the relevant part was omitted or cut off, and explain the gap in "answer". Otherwise use "answered".',
-  '- "citations" lists the IDs of every heading, link, navigation link, control or text excerpt your answer relies on. An ID is the code at the start of an entry, before the " | " (or after "ID" in the text excerpt title). Copy each ID exactly and alone, with no brackets, quotes or other characters. Use [] if there are none. Never invent IDs.',
+  '- Reply with JSON only, in this shape: {"status": "answered" or "insufficient_evidence", "entries": string[], "citations": string[], "answer": string}, with the keys in that order. Use "insufficient_evidence" when the snapshot does not contain what is needed to answer, including when the relevant part was omitted or cut off, and explain the gap in "answer". Otherwise use "answered".',
+  '- An ID is the code at the start of an entry, before the " | " (or after "ID" in the text excerpt title). Every item in "entries" and "citations" is only such an ID, copied exactly and alone, with no brackets, quotes or whole lines. Never invent IDs.',
+  '- "entries": ONLY when the user asks you to list, quote or give specific headings, links, navigation links or controls: the IDs of exactly those items, in the order you present them. For a summary, an explanation, a comparison or a yes/no question, "entries" is [] (an empty list), even if your answer mentions headings.',
+  '- "citations": at most 5 IDs, the entries that most directly support what you state in "answer". For a summary or explanation: the page text excerpt ID plus up to 4 headings or links behind its main points. An "answered" reply names at least one ID in "citations" or "entries". Never cite every entry you can see, never cite entries you did not use, and do not repeat IDs that are already in "entries". Use [] only when nothing supports the answer.',
 ].join("\n");
 
 // Element references
@@ -69,6 +85,9 @@ const excerptDetailsEl = document.getElementById("excerpt-details");
 const excerptEl = document.getElementById("excerpt");
 const sourcesSection = document.getElementById("sources-section");
 const sourcesNote = document.getElementById("sources-note");
+const entriesHeading = document.getElementById("entries-heading");
+const entriesList = document.getElementById("entries-list");
+const otherSourcesHeading = document.getElementById("other-sources-heading");
 const sourcesList = document.getElementById("sources-list");
 const sourcesWarnings = document.getElementById("sources-warnings");
 
@@ -129,6 +148,9 @@ function clearPageContext(reason) {
 function clearSources() {
   sourcesSection.hidden = true;
   sourcesNote.textContent = "";
+  entriesHeading.hidden = true;
+  entriesList.textContent = "";
+  otherSourcesHeading.hidden = true;
   sourcesList.textContent = "";
   sourcesWarnings.textContent = "";
 }
@@ -696,7 +718,23 @@ function buildEvidence(snapshot, version, budget) {
   }
   records.set(`${version}:T`, Object.freeze({ id: `${version}:T`, type: "text", sent: !chosen.textOmitted }));
 
+  // What the model did NOT see, stated from the capture counts (not by the model).
+  const omittedBits = [];
+  const omit = (s, noun) => { if (s.shown < s.total) omittedBits.push(`${s.total - s.shown} of ${s.total} ${noun}`); };
+  omit(chosen.h, "headings"); omit(chosen.l, "links"); omit(chosen.n, "navigation links"); omit(chosen.c, "controls");
+  const coverageBits = [];
+  if (chosen.textOmitted) coverageBits.push("the page text was left out");
+  else if (chosen.textCut) coverageBits.push("the page text was cut off");
+  if (omittedBits.length > 0) coverageBits.push(`${omittedBits.join(", ")} were not shown to the model`);
+  const capped = [];
+  if (snapshot.headingsCapped) capped.push("headings");
+  if (snapshot.linksCapped) capped.push("links");
+  if (snapshot.navLinksCapped) capped.push("navigation links");
+  if (snapshot.controlsCapped) capped.push("controls");
+  if (capped.length > 0) coverageBits.push(`the scan limit was reached for ${capped.join(", ")}`);
+
   return {
+    coverage: coverageBits.length > 0 ? `Coverage is partial: ${coverageBits.join("; ")}.` : "",
     snapshotText: chosen.snapshotText,
     truncated: chosen.h.truncated || chosen.l.truncated || chosen.n.truncated || chosen.c.truncated || chosen.textCut,
     records,
@@ -736,7 +774,7 @@ function buildPagePrompt(question, snapshotText) {
 const ID_PATTERN = /^s\d+:(?:[HLNC]\d+|T)$/;
 
 // Validate the model's reply. Never treats a bad reply as a success:
-//   { ok: true, status, answer, citations }
+//   { ok: true, status, answer, entries, citations }
 //   { ok: false, reason }   reason says which check failed
 function parseStructuredReply(text) {
   let value;
@@ -758,25 +796,41 @@ function parseStructuredReply(text) {
   if (!REPLY_STATUSES.includes(value.status)) {
     return { ok: false, reason: `its status "${clipText(value.status, 40)}" is not one of: ${REPLY_STATUSES.join(", ")}` };
   }
-  return { ok: true, status: value.status, answer: value.answer, citations: value.citations };
+  // "entries" is optional (a reply without it lists nothing); a wrong type is malformed.
+  const entries = value.entries === undefined ? [] : value.entries;
+  if (!Array.isArray(entries)) {
+    return { ok: false, reason: 'its "entries" field was not a list' };
+  }
+  const named = entries.length + value.citations.length;
+  if (named > MAX_REPLY_IDS) {
+    return { ok: false, reason: `it named ${named} evidence IDs, more than the ${MAX_REPLY_IDS} the panel will process` };
+  }
+  return { ok: true, status: value.status, answer: value.answer, entries, citations: value.citations };
 }
 
-// Look every cited ID up in the stored capture. Only an exact match counts;
-// nothing the model wrote (URLs included) is ever used as a destination.
+// Look EVERY distinct ID up in the stored capture, in the order given. Only an
+// exact match counts; nothing the model wrote (URLs included) is ever used as a
+// destination. There is no count limit here: a limit on what is DRAWN lives in
+// renderSources, never in the checking.
 function resolveCitations(cited, context) {
   const verified = [];
   const problems = [];
   const seen = new Set();
-  let ignored = 0;
 
+  let position = 0;
   for (const raw of cited) {
+    position++;
     const shown = typeof raw === "string" ? clipText(raw.trim(), 40) : "(not text)";
-    const key = typeof raw === "string" ? raw.trim() : shown;
-    if (seen.has(key)) continue;
-    if (seen.size >= MAX_CITED) {
-      ignored++;
-      continue;
+    // Non-text items are never duplicates of each other: each one is reported.
+    // The prompt defines an ID as "the code before ' | '", so a model that copies a whole
+    // snapshot line ("s1:H2 | h2: ...") is read by its leading ID. Only that ID is used: the
+    // text after the bar is ignored, so a mistyped copy can never change what is drawn.
+    let key = typeof raw === "string" ? raw.trim() : `\u0000not-text-${position}`;
+    if (typeof raw === "string") {
+      const wholeLine = /^(s\d+:(?:[HLNC]\d+|T)) \| /.exec(key);
+      if (wholeLine) key = wholeLine[1];
     }
+    if (seen.has(key)) continue; // a duplicate is the same claim: check it once
     seen.add(key);
 
     if (typeof raw !== "string" || !ID_PATTERN.test(key)) {
@@ -799,7 +853,7 @@ function resolveCitations(cited, context) {
     }
     verified.push(record);
   }
-  return { verified, problems, ignored };
+  return { verified, problems };
 }
 
 function addText(parent, tag, text, className) {
@@ -861,16 +915,21 @@ function buildSourceItem(record) {
   return li;
 }
 
-// Show the cited evidence. Every cited ID is checked against the current
-// capture the same way for BOTH statuses; `status` only decides what an EMPTY
-// citation list means. Returns { found, problems, uncited, unchecked }.
-function renderSources(cited, version, status) {
+// Show the evidence behind an answer. EVERY ID the reply named ("entries" and
+// "citations") is checked against the capture the answer was based on, the same
+// way for both statuses; `status` only decides what an EMPTY list means. Only
+// the DRAWING is capped, and what is not drawn is counted, never skipped.
+//   entries   -> drawn first, as exact data from the capture, in the model's order
+//   citations -> drawn as ordinary source cards (anything already listed is not repeated)
+// Returns counts for the status line.
+function renderSources(entries, citations, version, status) {
   clearSources();
+  const named = entries.concat(citations);
 
-  // Nothing cited and the model says the capture lacks the answer: there is
+  // Nothing named and the model says the capture lacks the answer: there is
   // nothing to check, and nothing is missing.
-  if (cited.length === 0 && status === "insufficient_evidence") {
-    return { found: 0, problems: 0, uncited: false, unchecked: false };
+  if (named.length === 0 && status === "insufficient_evidence") {
+    return { found: 0, listed: 0, problems: 0, uncited: false, unchecked: false, hiddenSources: 0 };
   }
   sourcesSection.hidden = false;
 
@@ -879,13 +938,18 @@ function renderSources(cited, version, status) {
   if (!context) {
     sourcesNote.textContent =
       "The tab changed or the capture was cleared before this answer arrived, so its citations can't be checked. No destinations are shown.";
-    return { found: 0, problems: 0, uncited: false, unchecked: true };
+    return { found: 0, listed: 0, problems: 0, uncited: false, unchecked: true, hiddenSources: 0 };
   }
   sourcesNote.textContent =
-    `Snapshot ${context.version} of ${context.url}. A source card shows only that the ID exists in that capture, not that the answer uses it correctly.`;
+    `Snapshot ${context.version} of ${context.url}. A card shows that the ID exists in that capture and what it contains; it does not show that the answer uses it correctly.`;
 
-  const { verified, problems, ignored } = resolveCitations(cited, context);
-  const uncited = cited.length === 0; // here, status is "answered"
+  const { verified, problems } = resolveCitations(named, context); // checks all, in order
+  const leadingId = (e) => { const t = e.trim(); const m = /^(s\d+:(?:[HLNC]\d+|T)) \| /.exec(t); return m ? m[1] : t; };
+  const listedIds = new Set(entries.filter((e) => typeof e === "string").map(leadingId));
+  const listed = verified.filter((r) => listedIds.has(r.id)); // entries come first, so this is the model's order
+  const others = verified.filter((r) => !listedIds.has(r.id));
+
+  const uncited = named.length === 0; // here, status is "answered"
   if (uncited) {
     addText(
       sourcesWarnings,
@@ -893,17 +957,31 @@ function renderSources(cited, version, status) {
       "This answer cites no captured evidence, so no source is listed and it is not backed by the capture."
     );
   }
-  for (const record of verified) sourcesList.appendChild(buildSourceItem(record));
-  for (const problem of problems) {
+
+  entriesHeading.hidden = listed.length === 0;
+  for (const record of listed.slice(0, MAX_LISTED_SHOWN)) entriesList.appendChild(buildSourceItem(record));
+  if (listed.length > MAX_LISTED_SHOWN) {
+    addText(entriesList, "li", `${listed.length - MAX_LISTED_SHOWN} more listed entries were checked but are not drawn (display limit ${MAX_LISTED_SHOWN}).`);
+  }
+
+  otherSourcesHeading.hidden = others.length === 0;
+  for (const record of others.slice(0, MAX_SOURCE_CARDS)) sourcesList.appendChild(buildSourceItem(record));
+  const hiddenSources = Math.max(0, others.length - MAX_SOURCE_CARDS);
+  if (hiddenSources > 0) {
+    addText(sourcesList, "li", `${hiddenSources} more cited source(s) were checked and exist in the capture, but are not drawn (display limit ${MAX_SOURCE_CARDS}).`);
+  }
+
+  for (const problem of problems.slice(0, MAX_PROBLEM_LINES)) {
     const li = document.createElement("li");
     addText(li, "code", problem.id);
     addText(li, "span", ` ${problem.message}`);
     sourcesWarnings.appendChild(li);
   }
-  if (ignored > 0) addText(sourcesWarnings, "li", `${ignored} more citation(s) were not checked (limit ${MAX_CITED}).`);
-  return { found: verified.length, problems: problems.length + (ignored > 0 ? 1 : 0), uncited, unchecked: false };
+  if (problems.length > MAX_PROBLEM_LINES) {
+    addText(sourcesWarnings, "li", `${problems.length - MAX_PROBLEM_LINES} more problem(s) were found but are not listed (display limit ${MAX_PROBLEM_LINES}).`);
+  }
+  return { found: verified.length, listed: listed.length, problems: problems.length, uncited, unchecked: false, hiddenSources };
 }
-
 // ---- Sending requests -------------------------------------------------------
 
 // Shared by plain chat and page questions.
@@ -1010,17 +1088,20 @@ async function runRequest(initialStatus, buildPrompt) {
         "Not enough captured information. This is the model's own report, not proof, so check the capture." +
         (answer === "" ? " The model gave no explanation." : "");
     } else {
-      note = answer === "" ? "Done, but the model returned an empty reply." : "Done.";
+      const namesItems = built.structured && (parsed.entries.length > 0 || parsed.citations.length > 0);
+      note = answer === "" && !namesItems ? "Done, but the model returned an empty reply." : "Done.";
     }
     if (built.successNote) note += " " + built.successNote;
     if (built.structured) {
-      const r = renderSources(parsed.citations, built.version, parsed.status);
+      const r = renderSources(parsed.entries, parsed.citations, built.version, parsed.status);
       if (r.unchecked) {
         note += " Citations could not be checked because the capture was cleared.";
       } else if (r.uncited) {
         note += " No captured evidence was cited.";
       } else if (r.found > 0 || r.problems > 0) {
-        note += ` Citations found in this capture: ${r.found}` + (r.problems > 0 ? `, ${r.problems} problem(s) (see Sources).` : ".");
+        note += ` IDs found in this capture: ${r.found}` + (r.problems > 0 ? `, ${r.problems} problem(s) (see Sources).` : ".");
+        if (r.listed > 0) note += ` ${r.listed} listed entr${r.listed === 1 ? "y is" : "ies are"} copied from the capture; the answer text is written by the model, so if it disagrees with the listed entries, trust the entries.`;
+        if (r.hiddenSources > 0) note += ` ${r.hiddenSources} more checked source(s) are not drawn.`;
       }
     }
     if (built.showStats && typeof data.prompt_eval_count === "number") {
@@ -1134,7 +1215,7 @@ async function askAboutPage() {
       format: REPLY_SCHEMA,
       structured: true,
       version,
-      successNote: `Answer based on snapshot ${version} (${snapshot.url})${evidence.truncated ? "; some content was omitted or cut off" : ""}.`,
+      successNote: `Answer based on snapshot ${version} (${snapshot.url}).${evidence.coverage ? " " + evidence.coverage : ""}`,
       showStats: true,
     };
   });
