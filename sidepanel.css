@@ -147,6 +147,90 @@ textarea:focus-visible {
   outline-offset: 3px;
 }
 
+.page-context {
+  margin-top: 14px;
+}
+
+.page-context h2 {
+  margin-top: 0;
+}
+
+#page-info {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+#excerpt-details {
+  margin-top: 8px;
+}
+
+#excerpt-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+#excerpt {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px dashed var(--black);
+  border-radius: 8px;
+  font: 12px/1.4 var(--sans);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sources {
+  margin-top: 4px;
+}
+
+#sources-note {
+  font-size: 12px;
+  margin: 0 0 6px;
+}
+
+.sources ul {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sources li {
+  margin: 0 0 8px;
+  padding: 8px;
+  border: 1px solid var(--black);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.sources .warnings li {
+  border-style: dashed;
+  font-weight: 600;
+}
+
+.sources code {
+  font: 12px/1.4 ui-monospace, Consolas, monospace;
+}
+
+.destination {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.destination code {
+  flex: 1;
+  min-width: 0;
+}
+
+.destination button {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 #status {
   margin: 14px 0 0;
   padding: 8px 10px;

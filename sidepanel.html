@@ -22,18 +22,49 @@
           <button type="submit" id="send-button">Send</button>
           <button type="button" id="stop-button" disabled>Stop</button>
         </div>
+        <div class="buttons">
+          <button type="button" id="ask-page-button">Ask about this page</button>
+        </div>
+        <p class="hint">
+          Send is plain chat. Only "Ask about this page" reads the active tab.
+        </p>
       </form>
+
+      <section class="page-context" aria-labelledby="page-context-heading">
+        <h2 id="page-context-heading">Page context</h2>
+        <p id="page-info">No page captured.</p>
+        <details id="excerpt-details" hidden>
+          <summary>Show exactly what was captured</summary>
+          <pre id="excerpt"></pre>
+        </details>
+      </section>
 
       <p id="status" role="status" aria-live="polite">Ready.</p>
 
       <h2>Reply</h2>
       <pre id="reply" aria-live="polite"></pre>
 
+      <section id="sources-section" class="sources" aria-labelledby="sources-heading" hidden>
+        <h2 id="sources-heading">Sources</h2>
+        <p id="sources-note"></p>
+        <ul id="sources-list"></ul>
+        <ul id="sources-warnings" class="warnings"></ul>
+      </section>
+
       <p class="note">
         Stop cancels the browser's request. It does not prove Ollama stopped
         computing; the server may finish the current generation on its own.
       </p>
+      <p class="note">
+        To let Cloudy read a page, first click Cloudy's toolbar icon while that
+        tab is active; buttons inside this panel do not grant access. Only the
+        main page's rendered text is read (not iframes, images, canvas or other
+        pages). Form values and editable text are never read, but visible text
+        can still contain personal information. It goes only to your local
+        Ollama, is kept in memory, and is not stored.
+      </p>
     </main>
+    <script src="capture.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>
