@@ -256,7 +256,10 @@ node tests/pipeline.test.js     # a fake model reply -> parsing -> ID checking -
 node tests/make-action-fixtures.js && node tests/dump-targets.js   # fixtures -> real targets.js in headless Chrome
 node tests/targets.test.js      # what the page-side capture returned (privacy, names, bounds, DOM changes)
 node tests/proposal.test.js     # fake model reply -> validation -> live recheck -> what is displayed
+node tests/positions.test.js     # control rectangles/centres, what is serialized to the model (no model call)
 node tests/action-model.test.js 5   # the local model's DECISIONS (rate per scenario)
+node tests/position-model.test.js 4 # the local model on positional goals ("bottom left", "the button")
+node tests/measure-prompt.js act_addremove "click the bottom left button" 3   # real prompt tokens for one fixture + goal
 node tests/render-panel.js      # the real panel in headless Chrome at side-panel width (screenshots)
 node tests/model.test.js ref_contents_main 5   # asks the local model; reports a pass rate
 node tests/dump-captures.js <url> <name>       # capture a live page, then: node tests/model.test.js <name> 5
@@ -287,6 +290,27 @@ and the placeholder as a **flagged weak fallback**), not a full accessibility tr
 - **Not covered, and reported:** iframes, shadow roots and canvas are counted, not entered.
 - **Bounded:** at most 150 controls are captured and about 3200 characters are sent to the model; the rest is
   stated as omitted. The 4000-character Q&A budget is separate and unchanged.
+
+### Control positions
+
+Each control's box comes from `getBoundingClientRect()` (x, y, width, height in CSS pixels from the viewport's
+top-left, rounded to 0.1 px). The **full box stays in the panel's memory**. The model only gets the rounded **centre**
+beside the control's existing position/state, for example:
+
+```
+a1:E2 | button | name: "Delete" | region: main | in view [35,111] | same name as 3 other control(s), this is 1 of 4
+```
+
+The format is defined once, in the prompt's `Viewport:` line: viewport W x H in CSS pixels, `[x,y]` = the control's
+centre from the viewport's top-left, x rightwards, y downwards. Offscreen controls keep their real centre (outside
+0..W or 0..H) and stay marked OFFSCREEN. A control with no box of its own is listed as "position unknown" with no
+coordinates. For goals with position words ("bottom left", "first", "next to") the model is told to decide from the
+relative layout of the controls that fit the rest of the goal and to answer with the control **ID**, never with
+coordinates. If the goal does not single out one control it should ask, and a positional request that cannot be
+resolved is not a reason to scroll.
+
+Positions are read again with every fresh capture (each click on Suggest next action). Nothing re-captures on
+scroll, resize or tab events, and a scroll does not make a proposal "stale". Nothing acts on coordinates.
 
 ### What the panel checks (format, not wisdom)
 

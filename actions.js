@@ -56,6 +56,27 @@ function actInt(value, max) {
   return Number.isInteger(value) && value >= 0 ? Math.min(value, max) : 0;
 }
 
+// A control's box as the page reported it (getBoundingClientRect, CSS pixels from
+// the viewport's top-left). Kept in full, locally. Anything that is not a finite
+// number is rejected, and values are clamped, because the page controls them.
+const RECT_LIMIT = 1000000;
+function actCoord(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.round(Math.max(-RECT_LIMIT, Math.min(RECT_LIMIT, value)) * 10) / 10;
+}
+function normalizeRect(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const rect = { x: actCoord(raw.x), y: actCoord(raw.y), w: actCoord(raw.w), h: actCoord(raw.h) };
+  if (rect.x === null || rect.y === null || rect.w === null || rect.h === null || rect.w < 0 || rect.h < 0) return null;
+  return rect;
+}
+// Rounded centre [x, y] of a rectangle, or null when the box has no size at all
+// (a control with no box of its own: its position is unknown, not 0,0).
+function rectCentre(rect) {
+  if (!rect || (rect.w === 0 && rect.h === 0)) return null;
+  return [Math.round(rect.x + rect.w / 2), Math.round(rect.y + rect.h / 2)];
+}
+
 // The page controls the text of its own labels, so re-check everything that came
 // back instead of trusting the shape. Returns a clean copy, or null.
 function normalizeTargetCapture(raw) {
@@ -67,6 +88,7 @@ function normalizeTargetCapture(raw) {
     if (!t || typeof t !== "object" || !Number.isInteger(t.n) || t.n < 1 || seen.has(t.n)) continue;
     if (!TARGET_KIND_SET.has(t.kind) || typeof t.signature !== "string" || !/^[0-9a-f]{8}$/.test(t.signature)) continue;
     seen.add(t.n);
+    const rect = normalizeRect(t.rect);
     targets.push({
       n: t.n,
       kind: t.kind,
@@ -78,6 +100,8 @@ function normalizeTargetCapture(raw) {
       submit: t.submit === true,
       sensitive: t.sensitive === true,
       viewport: TARGET_VIEWPORT_SET.has(t.viewport) ? t.viewport : "unknown",
+      rect, // full box, kept locally only
+      centre: rectCentre(rect), // [x, y], the only position data that is sent to the model
       region: TARGET_REGION_SET.has(t.region) ? t.region : "page",
       signature: t.signature,
     });
@@ -176,7 +200,9 @@ function nameField(t) {
 }
 
 function targetLine(rec) {
-  const parts = [rec.id, kindWords(rec), nameField(rec), `region: ${rec.region}`, VIEWPORT_WORDS[rec.viewport]];
+  // The format of [x,y] is defined once, in the Viewport line of buildActionPrompt.
+  const at = rec.centre ? ` [${rec.centre[0]},${rec.centre[1]}]` : "";
+  const parts = [rec.id, kindWords(rec), nameField(rec), `region: ${rec.region}`, VIEWPORT_WORDS[rec.viewport] + at];
   if (rec.support.unsupported) parts.push(`UNSUPPORTED (${rec.support.unsupported})`);
   if (rec.disabled) parts.push("DISABLED");
   if (rec.readOnly) parts.push("READ-ONLY");
@@ -226,6 +252,8 @@ const ACTION_SYSTEM_PROMPT = [
   "  cannot: say briefly why the listed controls cannot advance the goal (for example it needs an UNSUPPORTED control, or nothing listed fits).",
   "- Do not choose controls marked DISABLED, READ-ONLY or UNSUPPORTED. Do not choose controls that buy, pay, order, delete, remove, send, post, publish, confirm, subscribe, sign out or do something similarly consequential: reply cannot or ask_user instead.",
   '- A name marked "placeholder" is a weak hint, not a real label. Several controls can share a name; tell them apart by ID, region and position.',
+  '- Position words in the goal (left, right, top, bottom, first, last, row, corner, next to, above, below) refer to the layout. Decide them from the [x,y] centres, relative to the other controls that fit the rest of the goal (the named control, or the kind of control the goal says): smaller x is further left, larger y is lower, and centres whose y values are within a few pixels of each other are one row. Positions are relative to those other candidates, not to the viewport edges or the middle of the screen: the lowest candidate is "bottom" even if it is far from the bottom edge. A corner is a row plus a side: "bottom left" is the lowest row, then the smallest x in that row; "top right" is the highest row, then the largest x in that row. In "rationale", name the controls and the [x,y] values you compared. Answer with the chosen control\'s ID, never with coordinates.',
+  '- If the goal does not single out one control, use ask_user with one short question instead of guessing which one the user means. That includes a goal that names only a kind ("click the button") when more than one such control is listed, and a position that matches several controls equally. Use scroll only when the control you need is missing from the list or OFFSCREEN, never because a positional request could not be resolved.',
   "- If the control the goal names is NOT in the TARGETS list (the list says how many were omitted), do not pick a similar-looking one: use scroll, ask_user or cannot. A near match is not the control the user asked for.",
   "- Fill in only the fields the chosen action uses. Every other field must be \"\".",
   '- One step only, no plans. Write "rationale" FIRST, as one short plain sentence: which listed control (if any) really matches the goal, and why. Then choose the action that follows from it. If your rationale says nothing matches, the action must be scroll, ask_user or cannot.',
@@ -239,7 +267,12 @@ function buildActionPrompt(goal, norm, snapshot, packed) {
   const ctx = [];
   ctx.push(`Title: ${JSON.stringify(norm.title)}`);
   ctx.push(`Address: ${norm.url} (query string and fragment removed)`);
-  ctx.push(`Viewport: ${norm.viewport.w} x ${norm.viewport.h} pixels. Controls marked OFFSCREEN cannot be clicked until the page is scrolled.`);
+  // The one place the position format is defined: the [x,y] after a control's position.
+  ctx.push(
+    `Viewport: ${norm.viewport.w} x ${norm.viewport.h} CSS pixels. [x,y] is a control's centre in CSS pixels from the viewport's top-left corner, ` +
+      `x rightwards and y downwards (a centre outside 0..${norm.viewport.w} or 0..${norm.viewport.h} is offscreen). ` +
+      "Controls marked OFFSCREEN cannot be clicked until the page is scrolled."
+  );
   const notes = [];
   if (norm.scope.iframes > 0) notes.push(`${norm.scope.iframes} iframe(s)`);
   if (norm.scope.openShadowRoots > 0) notes.push(`${norm.scope.openShadowRoots} open shadow root(s)`);

@@ -22,6 +22,10 @@
 //    UNSUPPORTED; the panel will not accept a proposal that targets them.
 //  - Link destinations are not returned. Each target carries a short hash
 //    ("signature") so the panel can notice that the page changed.
+//  - Each target also carries its box from getBoundingClientRect() (x, y, w, h
+//    in CSS pixels from the viewport's top-left, rounded to 0.1 px). That is
+//    geometry only. It is NOT part of the signature, so scrolling or resizing
+//    does not make a page look "changed"; it is read again with every capture.
 //
 // This is a SUPPORTED SUBSET of the accessible-name computation, not a
 // complete accessibility-tree implementation. It does not enter iframes or
@@ -203,6 +207,13 @@ function captureActionTargets(limits) {
     return r.right <= 0 ? "left" : "right";
   }
 
+  // The control's box in CSS pixels from the viewport's top-left corner.
+  function rectOf(el) {
+    const r = el.getBoundingClientRect();
+    const q = (v) => Math.round(v * 10) / 10;
+    return { x: q(r.left), y: q(r.top), w: q(r.width), h: q(r.height) };
+  }
+
   function regionOf(el) {
     let sawForm = false;
     for (let p = el.parentElement; p; p = p.parentElement) {
@@ -282,6 +293,7 @@ function captureActionTargets(limits) {
           SENSITIVE_RE.test(el.getAttribute("id") || ""));
       const region = regionOf(el);
       const viewport = viewportStatus(el);
+      const rect = rectOf(el);
       const destHash = kind === "link" && el.href ? hash(String(el.href)) : "";
       const signature = hash([kind, cls.inputType || "", name, source, disabled, readOnly, !!cls.submit, region, pathOf(el), destHash].join("\u0001"));
       signatures.push(signature);
@@ -296,6 +308,7 @@ function captureActionTargets(limits) {
         submit: !!cls.submit,
         sensitive,
         viewport,
+        rect,
         region,
         signature,
       });
