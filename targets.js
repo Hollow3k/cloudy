@@ -7,7 +7,16 @@
 // region, but a search box or a menu usually lives OUTSIDE the article, so this
 // scans the whole main frame.
 //
-// It never changes the page, clicks, types, scrolls or follows a link.
+// It never changes the page, clicks, types, scrolls or follows a link. (Approved
+// actions run in executor.js, a separate function; this file only describes.)
+//
+// Element identity: every listed element gets a KEY (a number kept in a WeakMap
+// in the extension's isolated world, so it is stable for the life of the
+// document, unlike the per-capture IDs E1, E2... which shift when a control is
+// added earlier in the page). The same isolated world remembers key -> element
+// (weakly) and a describe(el) function that applies exactly the rules below, so
+// executor.js can re-check the SAME element before acting. Nothing is written to
+// the page itself, and the page cannot see the isolated world.
 //
 // Privacy rules (the same spirit as capture.js, stricter for form controls):
 //  - It never reads .value (or the value attribute) of ANY input, textarea or
@@ -44,6 +53,22 @@ function captureActionTargets(limits) {
   // Only a yes/no hint is returned; the attribute text itself never leaves the page.
   const SENSITIVE_RE = /pass(word|wd|code)?|pwd|otp|one.?time|2fa|mfa|cvv|cvc|csc|card.?(num|number)|cc.?(num|number|csc|exp)|ssn|social.?security|secret|token|api.?key|\bpin\b/i;
   const SENSITIVE_AUTOCOMPLETE = /(^|\s)(cc-[a-z-]+|current-password|new-password|one-time-code)(\s|$)/i;
+
+  // ---- Identity registry (isolated world only; see the header) ----
+  const docToken = String(performance.timeOrigin);
+  let world = globalThis.__cloudyTargets;
+  if (!world || world.token !== docToken) {
+    world = globalThis.__cloudyTargets = { token: docToken, keys: new WeakMap(), byKey: new Map(), next: 1, describe: null };
+  }
+  world.byKey.clear(); // rebuilt below from the controls that are listed now
+  function keyOf(el) {
+    let k = world.keys.get(el);
+    if (k === undefined) {
+      k = world.next++;
+      world.keys.set(el, k);
+    }
+    return k;
+  }
 
   function clip(text, max) {
     return text.length > max ? text.slice(0, Math.max(0, max - 1)) + "…" : text;
@@ -256,6 +281,36 @@ function captureActionTargets(limits) {
     return h.toString(16).padStart(8, "0");
   }
 
+  // Everything the panel is told about one listed control (no values, no text of fields).
+  function describeListed(el, cls) {
+    const kind = cls.kind;
+    const editable = kind === "text-field" || kind === "text-area" || kind === "password-field" || kind === "file-picker" || kind === "select-menu" || kind === "other-input";
+    const { name, source } = accessibleName(el, kind, cls.inputType || "");
+    const disabled = el.matches(":disabled") || el.getAttribute("aria-disabled") === "true" || !!el.closest("[inert]");
+    const readOnly = (kind === "text-field" || kind === "text-area") && (el.readOnly === true || el.getAttribute("aria-readonly") === "true");
+    const sensitive =
+      editable &&
+      (SENSITIVE_AUTOCOMPLETE.test(el.getAttribute("autocomplete") || "") ||
+        SENSITIVE_RE.test(el.getAttribute("name") || "") ||
+        SENSITIVE_RE.test(el.getAttribute("id") || ""));
+    const region = regionOf(el);
+    const viewport = viewportStatus(el);
+    const rect = rectOf(el);
+    const destHash = kind === "link" && el.href ? hash(String(el.href)) : "";
+    const signature = hash([kind, cls.inputType || "", name, source, disabled, readOnly, !!cls.submit, region, pathOf(el), destHash].join("\u0001"));
+    return { kind, inputType: cls.inputType || "", name, nameSource: source, disabled, readOnly, submit: !!cls.submit, sensitive, viewport, rect, region, signature };
+  }
+
+  // The same description for one element, computed NOW (null when it is no longer a listed,
+  // rendered control). executor.js uses this to re-check an approved target.
+  world.describe = function describe(el) {
+    displayCache.clear(); // computed styles may have changed since the capture
+    if (!el || !el.isConnected || el.closest("template, noscript, head")) return null;
+    const cls = classify(el);
+    if (cls === null || cls.kind === "hidden-input" || !isRendered(el)) return null;
+    return describeListed(el, cls);
+  };
+
   const body = document.body;
   const targets = [];
   let hiddenOmitted = 0;
@@ -281,37 +336,11 @@ function captureActionTargets(limits) {
         capped = true;
         break;
       }
-      const kind = cls.kind;
-      const editable = kind === "text-field" || kind === "text-area" || kind === "password-field" || kind === "file-picker" || kind === "select-menu" || kind === "other-input";
-      const { name, source } = accessibleName(el, kind, cls.inputType || "");
-      const disabled = el.matches(":disabled") || el.getAttribute("aria-disabled") === "true" || !!el.closest("[inert]");
-      const readOnly = (kind === "text-field" || kind === "text-area") && (el.readOnly === true || el.getAttribute("aria-readonly") === "true");
-      const sensitive =
-        editable &&
-        (SENSITIVE_AUTOCOMPLETE.test(el.getAttribute("autocomplete") || "") ||
-          SENSITIVE_RE.test(el.getAttribute("name") || "") ||
-          SENSITIVE_RE.test(el.getAttribute("id") || ""));
-      const region = regionOf(el);
-      const viewport = viewportStatus(el);
-      const rect = rectOf(el);
-      const destHash = kind === "link" && el.href ? hash(String(el.href)) : "";
-      const signature = hash([kind, cls.inputType || "", name, source, disabled, readOnly, !!cls.submit, region, pathOf(el), destHash].join("\u0001"));
-      signatures.push(signature);
-      targets.push({
-        n: targets.length + 1,
-        kind,
-        inputType: cls.inputType || "",
-        name,
-        nameSource: source,
-        disabled,
-        readOnly,
-        submit: !!cls.submit,
-        sensitive,
-        viewport,
-        rect,
-        region,
-        signature,
-      });
+      const d = describeListed(el, cls);
+      const key = keyOf(el);
+      world.byKey.set(key, new WeakRef(el));
+      signatures.push(d.signature);
+      targets.push({ n: targets.length + 1, key, ...d });
     }
   }
 

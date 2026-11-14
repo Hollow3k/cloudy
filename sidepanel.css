@@ -346,3 +346,55 @@ textarea:focus-visible {
 #suggest-button {
   font-size: 13px;
 }
+
+/* Approval and the result of an approved action. Black and white only. */
+#approval-note {
+  font-size: 12px;
+}
+#approve-button {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.execution {
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid var(--black);
+  border-left-width: 4px;
+  border-radius: 8px;
+}
+.execution h2 {
+  margin-top: 0;
+}
+.execution p {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
+#execution-action {
+  font: 600 15px/1.4 var(--sans);
+}
+#execution-status {
+  font-weight: 600;
+}
+#execution-goal,
+#execution-page {
+  font-size: 12px;
+}
+.execution summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 8px;
+}
+.execution pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px dashed var(--black);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 12px;
+}

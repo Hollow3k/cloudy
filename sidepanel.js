@@ -87,6 +87,16 @@ const proposalChecks = document.getElementById("proposal-checks");
 const proposalWarnings = document.getElementById("proposal-warnings");
 const proposalCoverage = document.getElementById("proposal-coverage");
 const proposalNote = document.getElementById("proposal-note");
+const approveButton = document.getElementById("approve-button");
+const approvalNote = document.getElementById("approval-note");
+const executionSection = document.getElementById("execution-section");
+const executionAction = document.getElementById("execution-action");
+const executionStatus = document.getElementById("execution-status");
+const executionEffect = document.getElementById("execution-effect");
+const executionGoal = document.getElementById("execution-goal");
+const executionPage = document.getElementById("execution-page");
+const afterDetails = document.getElementById("after-details");
+const afterText = document.getElementById("after-text");
 const targetsDetails = document.getElementById("targets-details");
 const targetsText = document.getElementById("targets-text");
 const rawReplyDetails = document.getElementById("raw-reply-details");
@@ -127,6 +137,15 @@ let pageContext = null;
 let actionCounter = 0;
 let actionContext = null;
 
+// Approval of ONE proposed action. null unless the proposal on screen is eligible. It is
+// bound to that exact action, target, text/direction, tab and document, and is CONSUMED
+// (set to null) before anything is dispatched, so a second click cannot run it again.
+let approvalCounter = 0;
+let pendingApproval = null;
+// The approved action while it is being checked or dispatched (Stop reads this).
+// { approval, cancelled, cancelReason, dispatching }
+let activeExecution = null;
+
 function setStatus(message, isError = false) {
   statusEl.textContent = message; // textContent: never parsed as HTML
   statusEl.classList.toggle("error", isError);
@@ -137,6 +156,7 @@ function setBusy(busy) {
   sendButton.disabled = busy;
   askPageButton.disabled = busy;
   suggestButton.disabled = busy;
+  approveButton.disabled = busy || pendingApproval === null; // never enabled without an approval
   stopButton.disabled = !busy;
   input.readOnly = busy; // still focusable, but can't be edited mid-request
 }
@@ -169,7 +189,29 @@ function clearPageContext(reason) {
 
 // ---- Proposal display (nothing here executes anything) ---------------------------
 
+// Any change that makes a displayed proposal no longer the one that was approved
+// (a new request, a tab or page change, a stale page) ends its approval.
+function dropApproval() {
+  pendingApproval = null;
+  approveButton.hidden = true;
+  approveButton.disabled = true;
+  approvalNote.textContent = "";
+}
+
+function clearExecution() {
+  executionSection.hidden = true;
+  executionAction.textContent = "";
+  executionStatus.textContent = "";
+  executionEffect.textContent = "";
+  executionGoal.textContent = "";
+  executionPage.textContent = "";
+  afterDetails.hidden = true;
+  afterDetails.open = false;
+  afterText.textContent = "";
+}
+
 function clearProposal() {
+  dropApproval();
   proposalSection.hidden = true;
   proposalSection.classList.remove("rejected");
   proposalBanner.textContent = "";
@@ -190,6 +232,7 @@ function clearProposal() {
 // The page, tab or document this proposal was made for is gone or changed:
 // keep the section but replace its content, so it cannot be read as current.
 function invalidateProposal(reason) {
+  dropApproval();
   actionContext = null;
   if (proposalSection.hidden) return;
   proposalSection.classList.add("rejected");
@@ -1154,6 +1197,7 @@ async function runRequest(initialStatus, buildPrompt) {
   replyEl.textContent = "";
   clearSources();
   clearProposal();
+  clearExecution();
   setStatus(initialStatus);
 
   const timeoutId = setTimeout(() => {
@@ -1482,7 +1526,7 @@ async function recheckActionTargets(ctx, record) {
   if (norm.fingerprint !== ctx.norm.fingerprint || norm.targets.length !== ctx.norm.targets.length) {
     return { state: "stale", reason: "other controls on the page changed since the capture (added, removed or changed)" };
   }
-  return { state: "fresh", reason: "", current, scroll: norm.scroll };
+  return { state: "fresh", reason: "", current, scroll: norm.scroll, viewport: norm.viewport };
 }
 
 async function evaluateActionReply(text, goal, ctx) {
@@ -1524,8 +1568,10 @@ function renderProposal(outcome, ctx, rawText) {
   targetsText.textContent = [`TARGETS (${c.shown} of ${c.total} shown):`, ...c.lines, ...(c.note ? [c.note] : [])].join("\n");
   targetsDetails.hidden = false;
 
+  dropApproval(); // a newly drawn proposal never inherits an older approval
   const FOOT =
-    "Nothing was clicked, typed, scrolled or opened, and Cloudy cannot do those things yet. " +
+    "Nothing has been clicked, typed, scrolled or opened. Cloudy acts only if you press Approve on one proposal, " +
+    "and then only after checking the page again. " +
     "A valid format means only that the target exists and fits the action; it does not mean the step is correct for your goal, relevant, or harmless.";
 
   if (result.kind === "malformed") {
@@ -1548,8 +1594,17 @@ function renderProposal(outcome, ctx, rawText) {
 
   if (result.kind === "rejected") {
     proposalSection.classList.add("rejected");
-    proposalBanner.textContent = "Proposal only. Not executed. REJECTED: this is not a valid target/action format.";
-    for (const r of result.reasons.slice(0, 6)) addLine(proposalChecks, r);
+    // Two different problems, told apart: the reply did not fit the format, or it was
+    // well-formed but one of Cloudy's own rules refuses it.
+    const hasBlocks = result.blocks.length > 0;
+    const hasInvalid = result.invalid.length > 0;
+    proposalBanner.textContent = !hasInvalid
+      ? "Proposal only. Not executed. REJECTED: blocked by Cloudy's safety rules (the reply's format was valid)."
+      : !hasBlocks
+        ? "Proposal only. Not executed. REJECTED: this is not a valid target/action format."
+        : "Proposal only. Not executed. REJECTED: invalid target/action format, and also blocked by Cloudy's safety rules.";
+    for (const r of result.invalid.slice(0, 6)) addLine(proposalChecks, `Invalid format: ${r}`);
+    for (const r of result.blocks.slice(0, 6)) addLine(proposalChecks, `Blocked by a rule: ${r}`);
     proposalNote.textContent = FOOT;
     return `Proposal rejected: ${result.reasons[0]} Nothing was executed.`;
   }
@@ -1565,6 +1620,12 @@ function renderProposal(outcome, ctx, rawText) {
     }
     proposalBanner.textContent = "Proposal only. Not executed. Valid target/action format.";
     proposalNote.textContent = FOOT;
+    const eligibility = executionEligibility(result, freshness);
+    if (eligibility.eligible) {
+      offerApproval(result, ctx);
+      return `Done. Proposal: ${describeProposal(result.proposal, result.record)} Valid target/action format; the page check passed just now. Nothing has been executed; press Approve to run this one step.`;
+    }
+    if (!eligibility.silent) addLine(proposalWarnings, `Not offered for approval: ${eligibility.reason}.`);
     return `Done. Proposal: ${describeProposal(result.proposal, result.record)} Valid target/action format; the page check passed just now. Nothing was executed.`;
   }
   proposalSection.classList.add("rejected");
@@ -1576,6 +1637,279 @@ function renderProposal(outcome, ctx, rawText) {
   addLine(proposalWarnings, `${whyCap}. Capture the page again with "Suggest next action" before relying on this proposal.`);
   proposalNote.textContent = FOOT;
   return `The proposal has a valid format, but ${why}. Capture again. Nothing was executed.`;
+}
+
+// ---- Approved execution of ONE action ------------------------------------------------------
+// Nothing here runs by itself. The model's proposal is displayed; only the Approve button
+// starts anything, for that one proposal, once. After the action the panel captures the page
+// again and stops: it never asks the model for another step.
+
+const SETTLE_MS = 450; // after dispatch, give a navigation a moment to start
+const SETTLE_MAX_POLLS = 12; // then wait (bounded) for the tab to finish loading
+
+// Bind the approval to exactly what is on screen: action, target, text or direction, tab,
+// document and the page's control list. It is not reused for anything else.
+function offerApproval(result, ctx) {
+  const p = result.proposal;
+  const rec = result.record || null;
+  pendingApproval = {
+    id: ++approvalCounter,
+    consumed: false,
+    action: p.action,
+    text: p.action === "type" ? p.text : "",
+    direction: p.action === "scroll" ? p.direction : "",
+    targetId: rec ? rec.id : "",
+    key: rec ? rec.key : 0,
+    signature: rec ? rec.signature : "",
+    kind: rec ? rec.kind : "",
+    tabId: ctx.tabId,
+    urlStripped: ctx.urlStripped,
+    documentToken: ctx.norm.documentToken,
+    fingerprint: ctx.norm.fingerprint,
+    controlCount: ctx.norm.targets.length,
+    goal: ctx.goal,
+    proposal: Object.freeze({ ...p }),
+    description: describeProposal(p, rec),
+    submit: !!(rec && rec.submit),
+  };
+  approvalNote.textContent =
+    `Approve runs only this one step: ${pendingApproval.description} ` +
+    "Cloudy checks the page and the control again first and refuses if anything differs. " +
+    (p.action === "scroll" ? "It scrolls the page itself by a bounded amount. " : "") +
+    (p.action === "type" ? "It enters the text without reading what the field holds, and does not submit the form. " : "") +
+    (pendingApproval.submit ? "This button submits a form. " : "") +
+    "It will not ask the model for another step, and Stop cannot undo it once it has run.";
+  approveButton.hidden = false;
+  approveButton.disabled = inFlight;
+}
+
+function refusal(headline, why) {
+  return { state: "refused", headline, why };
+}
+
+function cancelledResult(exec) {
+  return { state: "cancelled", headline: "Cancelled. Nothing was dispatched.", why: exec.cancelReason || "You pressed Stop before the action ran." };
+}
+
+// Wait (bounded) for a navigation the action may have started.
+async function settleTab(tabId) {
+  await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+  if (typeof chrome === "undefined" || !chrome.tabs || !chrome.tabs.get) return;
+  for (let i = 0; i < SETTLE_MAX_POLLS; i++) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (!t || t.status !== "loading") return;
+    } catch (_) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+// Everything before the dispatch. Returns a refusal/cancellation, or { spec, norm, current }.
+async function prepareApprovedAction(a, exec) {
+  let tab = null;
+  try {
+    tab = await getActiveTab();
+  } catch (_) {
+    tab = null;
+  }
+  if (exec.cancelled) return cancelledResult(exec);
+  if (!tab || tab.id !== a.tabId) return refusal("Not done: the active tab is not the one you approved this for.", "Open that tab again and make a new proposal.");
+  if (!tab.url) return refusal("Not done: Cloudy can no longer read this tab.", "Its access may have ended. Make a new proposal.");
+  if (stripUrl(tab.url) !== a.urlStripped) return refusal("Not done: the page address changed.", "Make a new proposal for the current page.");
+
+  // Read the page again, now.
+  let norm;
+  try {
+    norm = await readActionTargets(a.tabId);
+  } catch (error) {
+    return refusal("Not done: the page could not be read again.", error.message);
+  }
+  if (exec.cancelled) return cancelledResult(exec);
+  if (norm.documentToken !== a.documentToken) return refusal("Not done: the page was reloaded or replaced.", "The approval was for the earlier document. Make a new proposal.");
+
+  // The SAME element, found by its identity key (not by its E-number, which shifts when a
+  // control is added earlier in the page). Never another element that merely looks alike.
+  let current = null;
+  if (a.action !== "scroll") {
+    current = norm.targets.find((t) => t.key === a.key) || null;
+    if (!current) return refusal("Not done: the control is missing or hidden now.", "It is no longer on the page as a visible control. Nothing else was chosen in its place.");
+    if (current.signature !== a.signature) return refusal("Not done: the control changed.", "Its name, state or place in the page differs from the one you approved. Nothing else was chosen in its place.");
+  }
+  if (norm.fingerprint !== a.fingerprint || norm.targets.length !== a.controlCount) {
+    return refusal("Not done: the page changed since the proposal.", "Other controls were added, removed or changed. Make a new proposal.");
+  }
+
+  // The same rules as for the proposal, applied to the control as it is NOW.
+  const version = `a${++actionCounter}`;
+  const records = buildActionRecords(norm, version);
+  packTargets(records, ACTION_TARGET_BUDGET_CHARS);
+  const reply = JSON.stringify({ ...a.proposal, target_id: current ? `${version}:E${current.n}` : "" });
+  const check = validateActionReply(reply, a.goal, { version, records, scroll: norm.scroll });
+  if (check.kind !== "valid") {
+    const why = check.kind === "rejected" ? [...check.blocks, ...check.invalid].join(" ") : check.reasons.join(" ");
+    const blocked = check.kind === "rejected" && check.blocks.length > 0;
+    return refusal(blocked ? "Not done: blocked by Cloudy's safety rules." : "Not done: the proposal no longer passes the format check.", why);
+  }
+  if (a.action !== "scroll" && !STEP_VIEWPORT_OK.has(current.viewport)) {
+    return refusal("Not done: the control is not in view.", "Scroll first; a scroll needs its own approval.");
+  }
+  let step = 0;
+  if (a.action === "scroll") {
+    const plan = scrollPlan(a.direction, norm.scroll, norm.viewport);
+    if (!plan.ok) return refusal("Not done: this scroll is not possible.", `${plan.reason.charAt(0).toUpperCase()}${plan.reason.slice(1)}.`);
+    step = plan.step;
+  }
+  const spec = { action: a.action, token: a.documentToken, key: a.key, signature: a.signature, kind: a.kind, text: a.text, direction: a.direction, step };
+  return { spec, norm, current };
+}
+
+// Turn the page's reply into words. Only values that are bounded integers or fixed words are shown.
+function describeDispatchResult(a, r, beforeCount, after) {
+  if (a.action === "scroll") {
+    const moved = actInt(r.moved, 1e7);
+    const from = actInt(r.before, 1e8);
+    const to = actInt(r.after, 1e8);
+    const max = actInt(r.max, 1e8);
+    let effect = `The page scrolled ${a.direction} by ${moved} px (position ${from} to ${to} of ${max}).`;
+    if (after && after.norm) effect += ` The new capture reads position ${after.norm.scroll.top} of ${after.norm.scroll.max}.`;
+    return effect;
+  }
+  if (a.action === "type") {
+    return "The approved text was sent to the field. Cloudy never reads field values, so it cannot confirm what the field now holds.";
+  }
+  // click: only what the new capture can show
+  if (!after) return "The click was dispatched. The page could not be captured again, so no effect could be observed.";
+  const bits = [];
+  if (after.norm.documentToken !== a.documentToken) bits.push("the page navigated or reloaded");
+  else if (after.url !== a.urlStripped) bits.push("the page address changed");
+  const n = after.norm.targets.length;
+  if (n !== beforeCount) bits.push(`the number of controls went from ${beforeCount} to ${n}`);
+  return bits.length > 0
+    ? `Observed after the click: ${bits.join("; ")}.`
+    : "No change in the page's control list was observed. The click may still have had an effect Cloudy cannot see.";
+}
+
+async function captureAfter(a) {
+  const { tab } = await getReadableTab();
+  const norm = await readActionTargets(tab.id);
+  const version = `a${++actionCounter}`;
+  const records = buildActionRecords(norm, version);
+  const packed = packTargets(records, ACTION_TARGET_BUDGET_CHARS);
+  return { norm, version, packed, url: stripUrl(tab.url) };
+}
+
+// The whole approved run. Always resolves to a result object; it never throws.
+async function runApproved(a, exec) {
+  const prepared = await prepareApprovedAction(a, exec);
+  if (!prepared.spec) return prepared;
+  if (exec.cancelled) return cancelledResult(exec); // last look: no await between this and the next line
+  exec.dispatching = true;
+  setStatus("Dispatching the one approved action...");
+
+  let reply;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: a.tabId, allFrames: false }, // main frame only
+      world: "ISOLATED",
+      func: performApprovedAction,
+      args: [prepared.spec],
+    });
+    reply = results && results[0] ? results[0].result : undefined;
+  } catch (error) {
+    const kind = classifyScriptingError(String(error && error.message ? error.message : error)).captureKind;
+    if (kind === "no-access" || kind === "restricted" || kind === "tab-closed") {
+      return { state: "failed", headline: "Failed: the action was not dispatched.", why: "Chrome would not run it in this tab (access, restricted page or closed tab)." };
+    }
+    return {
+      state: "unconfirmed",
+      headline: "Dispatch not confirmed.",
+      why: `The page did not answer (${actClip(String(error && error.message ? error.message : error), 160)}). The action may or may not have run; check the page.`,
+    };
+  }
+  if (!reply || typeof reply.ok !== "boolean") {
+    return { state: "unconfirmed", headline: "Dispatch not confirmed.", why: "The page returned no answer. The action may or may not have run; check the page." };
+  }
+  if (!reply.ok) {
+    return { state: "failed", headline: "Failed: the action was not dispatched.", why: actClip(String(reply.reason || "The page refused it."), 200) };
+  }
+
+  // Dispatched. Capture again (unless Stop was pressed), and stop there.
+  let after = null;
+  let afterError = "";
+  if (!exec.cancelled) {
+    setStatus("Action dispatched. Capturing the page again (no further step is requested)...");
+    await settleTab(a.tabId);
+    try {
+      after = await captureAfter(a);
+    } catch (error) {
+      afterError = error.message;
+    }
+  } else {
+    afterError = "You pressed Stop after the action had run, so the follow-up capture was skipped.";
+  }
+  return { state: "dispatched", reply, after, afterError, effect: describeDispatchResult(a, reply, a.controlCount, after) };
+}
+
+function showExecutionResult(a, result) {
+  executionSection.hidden = false;
+  executionAction.textContent = `Approved step: ${a.description}`;
+  executionEffect.textContent = "";
+  executionPage.textContent = "";
+  afterDetails.hidden = true;
+  afterText.textContent = "";
+  if (result.state === "dispatched") {
+    executionStatus.textContent = "Action dispatched. (A dispatched action is not undone by Stop.)";
+    executionEffect.textContent = result.effect;
+    if (result.after) {
+      const n = result.after.norm;
+      executionPage.textContent = `Page captured again as ${result.after.version}: ${n.targets.length} control(s)${n.capped ? " (scan limit reached)" : ""}. No model call was made, and nothing more will run until you ask for a new proposal and approve it.`;
+      const c = result.after.packed;
+      afterText.textContent = [`CONTROLS NOW (${c.shown} of ${c.total} shown):`, ...c.lines, ...(c.note ? [c.note] : [])].join("\n");
+      afterDetails.hidden = false;
+    } else {
+      executionPage.textContent = `${result.afterError} No model call was made, and nothing more will run.`.trim();
+    }
+  } else {
+    executionStatus.textContent = `${result.headline} ${result.why || ""}`.trim();
+    executionEffect.textContent = "No action was dispatched." + (result.state === "unconfirmed" ? " (Not known: see above.)" : "");
+    if (result.state === "unconfirmed") executionEffect.textContent = "It is not known whether the action ran.";
+  }
+  executionGoal.textContent = "Goal verified: no. Cloudy does not judge whether your goal was met; look at the page yourself.";
+}
+
+// The Approve button. Everything up to and including consuming the approval is synchronous, so
+// a second click (or a double click) finds nothing to approve.
+async function approveProposal() {
+  const approval = pendingApproval;
+  if (!approval || approval.consumed || inFlight || activeExecution) return;
+  approval.consumed = true;
+  pendingApproval = null;
+  approveButton.hidden = true;
+  approveButton.disabled = true;
+  const exec = { approval, cancelled: false, cancelReason: "", dispatching: false };
+  activeExecution = exec;
+  setBusy(true);
+  proposalBanner.textContent = "This proposal was approved. It cannot be approved again.";
+  approvalNote.textContent = "";
+  proposalNote.textContent = "It was used once. What happened is shown under \"Approved action\" below.";
+  proposalSection.classList.add("rejected");
+  setStatus("Approved. Checking the page and the control again before acting...");
+
+  let result;
+  try {
+    result = await runApproved(approval, exec);
+  } catch (error) {
+    result = { state: "failed", headline: "Failed.", why: `Unexpected error: ${actClip(String(error && error.message ? error.message : error), 160)}` };
+  } finally {
+    activeExecution = null;
+    setBusy(false);
+  }
+  showExecutionResult(approval, result);
+  if (result.state === "dispatched") setStatus(`Action dispatched. ${result.effect} Goal not verified.`);
+  else if (result.state === "unconfirmed") setStatus(`${result.headline} ${result.why}`, true);
+  else setStatus(`${result.headline} ${result.why || ""}`.trim(), true);
 }
 
 // Separate mode: never runs for Send or Ask. The goal is what the user typed.
@@ -1606,10 +1940,33 @@ async function suggestNextAction() {
 }
 
 function stopRequest() {
+  // An approved action that has not been dispatched yet can still be cancelled. One that
+  // has been dispatched cannot be undone: Stop then only skips the follow-up capture.
+  if (activeExecution && !activeExecution.cancelled) {
+    activeExecution.cancelled = true;
+    activeExecution.cancelReason = "You pressed Stop before the action ran.";
+    setStatus(
+      activeExecution.dispatching
+        ? "The action was already dispatched. Stop cannot undo it; it only skips the follow-up capture."
+        : "Stopping. Nothing has been dispatched, and nothing will be.",
+      true
+    );
+    return;
+  }
   if (activeController && !abortCause) {
     abortCause = "user";
     activeController.abort();
   }
+}
+
+// A tab switch, navigation or close before the dispatch ends the pending action. (After the
+// dispatch there is nothing left to cancel.) `activeTabId` -1 means "the approved tab itself".
+function cancelUndispatchedExecution(activeTabId, reason) {
+  const exec = activeExecution;
+  if (!exec || exec.dispatching || exec.cancelled) return;
+  if (activeTabId !== -1 && activeTabId === exec.approval.tabId) return; // re-activating the same tab is harmless
+  exec.cancelled = true;
+  exec.cancelReason = reason;
 }
 
 // Event listeners (no inline handlers in the HTML)
@@ -1628,6 +1985,7 @@ input.addEventListener("keydown", (event) => {
 });
 
 stopButton.addEventListener("click", stopRequest);
+approveButton.addEventListener("click", approveProposal);
 askPageButton.addEventListener("click", askAboutPage);
 suggestButton.addEventListener("click", suggestNextAction);
 
@@ -1635,6 +1993,7 @@ suggestButton.addEventListener("click", suggestNextAction);
 // need no extra permission; they only tell us that something changed.)
 if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
   chrome.tabs.onActivated.addListener(({ tabId }) => {
+    cancelUndispatchedExecution(tabId, "You switched tabs before the action ran.");
     refreshAccessState();
     if (pageContext && tabId !== pageContext.tabId) {
       clearPageContext("You switched tabs, so the earlier capture was cleared.");
@@ -1645,6 +2004,9 @@ if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
   });
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     const navigated = changeInfo.status === "loading" || changeInfo.url;
+    if (navigated && activeExecution && tabId === activeExecution.approval.tabId) {
+      cancelUndispatchedExecution(-1, "The page navigated before the action ran.");
+    }
     // Ignore title and favicon updates for the access indicator.
     if (changeInfo.status || changeInfo.url) refreshAccessState();
     if (pageContext && tabId === pageContext.tabId && navigated) {
@@ -1655,6 +2017,7 @@ if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
+    if (activeExecution && tabId === activeExecution.approval.tabId) cancelUndispatchedExecution(-1, "The tab was closed before the action ran.");
     if (pageContext && tabId === pageContext.tabId) {
       clearPageContext("That tab was closed.");
     }

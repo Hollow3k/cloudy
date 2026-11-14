@@ -121,8 +121,8 @@ const read = (f) => fs.readFileSync(path.join(root, f), "utf8");
   p.state.fetchImpl = async () => ({ ok: true, json: async () => ({ response: JSON.stringify({ rationale: "E2 [35,111] is leftmost in the lowest row.", action: "click", target_id: `${A.getActionContext().version}:E2`, text: "", direction: "", question: "", reason: "" }), prompt_eval_count: 1, total_duration: 1 }) });
   await p.suggest("click the bottom left button");
   const v = p.actionView();
-  ok("6: the model's choice of the first Delete is shown by its ID and checked as before; 'Delete' is still refused as consequential-looking (policy unchanged)", v.rejected && v.checks.some((c) => /suggests a consequential action/.test(c)) && /E2/.test(v.action + v.checks.join(" ")) && /Nothing was clicked/.test(v.note), v.banner + " | " + v.checks.join(" // "));
-  ok("6: there is still no way to execute: no click/type/scroll/navigate calls", !/\.click\(|dispatchEvent|scrollTo\(|scrollBy\(|chrome\.tabs\.(update|create)|chrome\.debugger|elementFromPoint|Input\.dispatch/.test(code));
+  ok("6: the model's choice of the first Delete is shown by its ID and checked as before; 'Delete' is still refused as consequential-looking (policy unchanged)", v.rejected && v.checks.some((c) => /suggests a consequential action/.test(c)) && /E2/.test(v.action + v.checks.join(" ")) && /Nothing has been clicked/.test(v.note) && p.ids["approve-button"].hidden === true, v.banner + " | " + v.checks.join(" // "));
+  ok("6: the panel, actions and targets code contain no click/type/scroll/navigate calls (only executor.js acts, after approval)", !/\.click\(|dispatchEvent|scrollTo\(|scrollBy\(|chrome\.tabs\.(update|create)|chrome\.debugger|elementFromPoint|Input\.dispatch/.test(code));
   ok("6: coordinates are never used to look up or act on anything (no elementFromPoint, no coordinate parsing of the reply)", !/elementFromPoint|centre\[0\]\s*[<>]|parseCoord/.test(read("sidepanel.js") + read("actions.js").replace(/^.*centre.*$/gm, "")));
 
   console.log(results.join("\n"));

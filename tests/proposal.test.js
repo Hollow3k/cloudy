@@ -34,11 +34,11 @@ const dyn = (n) => JSON.parse(fs.readFileSync(path.join(out, `dyn_${n}.json`), "
   // ===== 1. Valid proposals, one of each action =====
   let v = await run("search for red running shoes", "act_store", (c) => act({ action: "type", target_id: idOfName(c, "Search products"), text: "red running shoes" }));
   ok("1: type into the search field -> valid target/action format, shown in plain words", !v.hidden && !v.rejected && /^Type "red running shoes" into the text field \(search\) "Search products" \[a1:E6\]\.$/.test(v.action), v.action);
-  ok("1: banner says valid FORMAT, not executed; status says nothing was executed", /Valid target\/action format/.test(v.banner) && /Not executed/.test(v.banner) && /Nothing was executed/.test(v.status) && v.isError === false, v.banner + " | " + v.status.slice(0, 160));
+  ok("1: banner says valid FORMAT, not executed; status says nothing was executed", /Valid target\/action format/.test(v.banner) && /Not executed/.test(v.banner) && /Nothing has been executed; press Approve to run this one step/.test(v.status) && v.isError === false, v.banner + " | " + v.status.slice(0, 160));
   ok("1: the model's reason is labelled as its own, unverified words", /^Model's reason \(its own words, not verified\): It matches/.test(v.rationale));
   ok("1: the checks list the structural facts and the page check", v.checks.some((c) => /one of the controls shown to the model \(a1\)/.test(c)) && v.checks.some((c) => /fits a text field/.test(c)) && v.checks.some((c) => /appears in your goal/.test(c)) && v.checks.some((c) => /Page check just now: same document/.test(c)), v.checks.join(" // "));
   ok("1: weak-name warning for the placeholder-only field", v.warnings.some((w) => /no real label; its name is only a placeholder/.test(w)));
-  ok("1: no 'safe/correct/harmless' claim anywhere except the negated footer; the footer disclaims", !bad.test(v.banner + v.status + v.checks.join("") + v.warnings.join("") + v.action + v.coverage) && /does not mean the step is correct for your goal, relevant, or harmless/.test(v.note) && /Nothing was clicked, typed, scrolled or opened, and Cloudy cannot do those things yet/.test(v.note));
+  ok("1: no 'safe/correct/harmless' claim anywhere except the negated footer; the footer disclaims", !bad.test(v.banner + v.status + v.checks.join("") + v.warnings.join("") + v.action + v.coverage) && /does not mean the step is correct for your goal, relevant, or harmless/.test(v.note) && /Nothing has been clicked, typed, scrolled or opened\. Cloudy acts only if you press Approve on one proposal/.test(v.note));
   ok("1: the controls sent to the model can be inspected", !v.targetsHidden && /^TARGETS \(\d+ of 37 shown\):/.test(v.targets) && /a1:E6 \| text field \(search\) \| placeholder \(NOT a real label\): "Search products" \| region: search \| in view/.test(v.targets));
   ok("1: coverage line reports counts and the scope gaps", /Capture a1: 37 controls captured, \d+ shown to the model/.test(v.coverage) && /4 hidden left out/.test(v.coverage) && /1 iframe\(s\), 1 open shadow root\(s\), 1 canvas element\(s\)/.test(v.coverage), v.coverage);
 
@@ -138,7 +138,7 @@ const dyn = (n) => JSON.parse(fs.readFileSync(path.join(out, `dyn_${n}.json`), "
   const subset = { snapshot: storeData.snapshot, targets: { ...storeData.targets, targets: storeData.targets.targets.filter((t) => [3, 4, 6, 7, 10, 15, 16, 17, 19, 20, 21, 22, 23, 25, 29, 30, 31, 32, 34].includes(t.n)) } };
   for (const [name, build, re] of rejected) {
     v = await run("search for red shoes", subset, build);
-    ok(`3: ${name}: rejected, with a reason, nothing proposed as valid`, !v.hidden && v.rejected && /REJECTED: this is not a valid target\/action format/.test(v.banner) && v.checks.some((c) => re.test(c)) && !/Valid target\/action format\./.test(v.banner) && /^Proposal rejected:/.test(v.status) && v.isError === true, v.checks.join(" // "));
+    ok(`3: ${name}: rejected, with a reason, nothing proposed as valid`, !v.hidden && v.rejected && (/disabled|read-only|password|file picker|select menu|editable region|card-number/.test(name) ? /REJECTED: blocked by Cloudy's safety rules \(the reply's format was valid\)/ : /REJECTED: this is not a valid target\/action format/).test(v.banner) && v.checks.some((c) => re.test(c)) && !/Valid target\/action format\./.test(v.banner) && /^Proposal rejected:/.test(v.status) && v.isError === true, v.checks.join(" // "));
   }
 
   // ===== 4. Typed text: only words from the goal; never secrets =====
@@ -324,7 +324,7 @@ const dyn = (n) => JSON.parse(fs.readFileSync(path.join(out, `dyn_${n}.json`), "
   const code = strip("sidepanel.js") + strip("actions.js") + strip("targets.js");
   ok("12: no code path can click, type, scroll, navigate, open tabs or attach a debugger", !/\.click\(|\.dispatchEvent|\.focus\(|chrome\.tabs\.(update|create|remove|reload|goBack|goForward)|chrome\.debugger|chrome\.windows|window\.open|location\.(assign|replace)|scrollTo\(|scrollBy\(|scrollIntoView|\.requestSubmit|execCommand|insertText|new Function|\beval\(|chrome\.scripting\.(insertCSS|registerContentScripts)/.test(code));
   const html = fs.readFileSync(path.join(root, "sidepanel.html"), "utf8");
-  ok("12: there is no Execute / Run / Apply / Do it control in the panel", !/>\s*(execute|run|apply|do it|perform|confirm)[^<]*</i.test(html) && (html.match(/<button/g) || []).length === 4);
+  ok("12: the only way to act is the Approve button, hidden by default; there is no Execute / Run / Do it control", !/>\s*(execute|run|apply|do it|perform|confirm)[^<]*</i.test(html) && (html.match(/<button/g) || []).length === 5 && /<button id="approve-button" type="button" hidden disabled>Approve this one action<\/button>/.test(html));
   ok("12: the page is only ever shown as plain text (no innerHTML/outerHTML/insertAdjacentHTML anywhere)", !/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(code));
   ok("12: no console logging in the new modules (so nothing can leak into logs)", !/console\./.test(strip("actions.js") + strip("targets.js")) && !/console\./.test(strip("sidepanel.js")));
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));

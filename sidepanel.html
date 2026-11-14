@@ -29,7 +29,8 @@
         <p class="hint">
           Send is plain chat. "Ask about this page" reads the active tab and answers a
           question. "Suggest next action" reads the tab's controls and proposes ONE step
-          toward the goal you typed. It only proposes: nothing is clicked or typed.
+          toward the goal you typed. Nothing is clicked, typed or scrolled unless you
+          press Approve on that one proposal.
         </p>
       </form>
 
@@ -75,11 +76,28 @@
           <pre id="raw-reply-text"></pre>
         </details>
         <p id="proposal-note"></p>
+        <p id="approval-note"></p>
+        <button id="approve-button" type="button" hidden disabled>Approve this one action</button>
+      </section>
+
+      <section id="execution-section" class="execution" aria-labelledby="execution-heading" hidden>
+        <h2 id="execution-heading">Approved action</h2>
+        <p id="execution-action"></p>
+        <p id="execution-status" role="status" aria-live="polite"></p>
+        <p id="execution-effect"></p>
+        <p id="execution-goal"></p>
+        <p id="execution-page"></p>
+        <details id="after-details" hidden>
+          <summary>Show the controls captured after the action</summary>
+          <pre id="after-text"></pre>
+        </details>
       </section>
 
       <p class="note">
         Stop cancels the browser's request. It does not prove Ollama stopped
-        computing; the server may finish the current generation on its own.
+        computing; the server may finish the current generation on its own. During an
+        approved action, Stop cancels it only if it has not been dispatched yet; it
+        never undoes an action that already ran.
       </p>
       <p class="note">
         Cloudy can read ordinary http and https pages without a toolbar click.
@@ -96,6 +114,7 @@
     <script src="capture.js"></script>
     <script src="targets.js"></script>
     <script src="actions.js"></script>
+    <script src="executor.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

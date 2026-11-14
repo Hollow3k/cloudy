@@ -19,7 +19,7 @@ class FakeEl {
   walk(fn) { fn(this); this.children.forEach((c) => c.walk(fn)); }
 }
 const ids = {};
-["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "access-state", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings", "suggest-button", "proposal-section", "proposal-banner", "proposal-action", "proposal-rationale", "proposal-checks", "proposal-warnings", "proposal-coverage", "proposal-note", "targets-details", "targets-text", "raw-reply-details", "raw-reply-text"].forEach((i) => (ids[i] = new FakeEl(i)));
+["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "access-state", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings", "suggest-button", "proposal-section", "proposal-banner", "proposal-action", "proposal-rationale", "proposal-checks", "proposal-warnings", "proposal-coverage", "proposal-note", "targets-details", "targets-text", "raw-reply-details", "raw-reply-text", "approve-button", "approval-note", "execution-section", "execution-action", "execution-status", "execution-effect", "execution-goal", "execution-page", "after-details", "after-text"].forEach((i) => (ids[i] = new FakeEl(i)));
 global.document = { getElementById: (i) => ids[i], createElement: (t) => new FakeEl(t) };
 Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async () => {} } }, configurable: true });
 const handlers = {};

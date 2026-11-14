@@ -65,6 +65,7 @@ async function main() {
             if (window.__mutated && window.__CALLS.filter((n) => n === "captureActionTargets").length >= 2) { t.targets[14].name = "Add to wishlist"; t.fingerprint = "deadbeef"; t.targets[14].signature = "0badc0de"; }
             return [{ result: t }];
           }
+          if (o.func.name === "performApprovedAction") return [{ result: { ok: true, action: o.args[0].action, kind: o.args[0].kind, method: "insertText" } }];
           return [{ result: real.snapshot }];
         } },
       };
@@ -103,6 +104,18 @@ async function main() {
       await shot("ui_" + name);
       console.log(name + ": " + state.status.slice(0, 110) + " | overflowX=" + state.overflowX);
     }
+    // Approve one valid proposal (the page-side action is a stub here) and show the result.
+    await send("Page.navigate", { url: "file:///" + path.join(root, "sidepanel.html").replace(/\\/g, "/") });
+    for (let i = 0; i < 80; i++) { await sleep(150); if ((await evalIn("typeof suggestNextAction")) === "function") break; }
+    await evalIn(`window.__reply = () => (${SCENARIOS.valid_type.reply})(actionContext); document.getElementById("prompt-input").value = "search for red running shoes"; document.getElementById("suggest-button").click(); 0`);
+    await sleep(900);
+    const approveShown = await evalIn(`!document.getElementById("approve-button").hidden`);
+    await evalIn(`document.getElementById("approve-button").click(); 0`);
+    await sleep(1500);
+    const approved = await evalIn(`({ calls: window.__CALLS.join(","), status: document.getElementById("status").textContent, goal: document.getElementById("execution-goal").textContent, overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth })`);
+    await shot("ui_approved_type");
+    console.log("approved_type: approve shown=" + approveShown + " | " + approved.status.slice(0, 100) + " | " + approved.goal.slice(0, 60) + " | overflowX=" + approved.overflowX);
+
     // Open the inspection panels once.
     await evalIn(`window.__reply = () => (${SCENARIOS.valid_type.reply})(actionContext); 0`);
     await send("Page.navigate", { url: "file:///" + path.join(root, "sidepanel.html").replace(/\\/g, "/") });

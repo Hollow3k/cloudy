@@ -8,10 +8,11 @@ in `sidepanel.js`) and shows the reply. It has two modes:
   active tab, sends it with your question to local Ollama, and shows the answer plus the evidence it cites.
 
 - **Suggest next action**: you type a goal and click it. Cloudy lists the page's controls and asks the local model for
-  ONE next step (click, type, scroll, ask you, or "cannot"). It only **proposes**: nothing is clicked, typed,
-  scrolled or opened, and there is no Execute button.
+  ONE next step (click, type, scroll, ask you, or "cannot"). It **proposes**; nothing happens until you press
+  **Approve** on that one proposal. Approve runs exactly that one action (see "Approving one action").
 
-There is no clicking, typing, scrolling or navigating on websites, no microphone, and no agent loop.
+Cloudy never acts on its own: no automatic chain of steps (after an approved action it captures the page again and
+stops), no microphone, no vision.
 
 ## Files
 
@@ -22,7 +23,8 @@ There is no clicking, typing, scrolling or navigating on websites, no microphone
 | `sidepanel.html` / `.css` / `.js` | The UI, the request logic, evidence building, and citation checking |
 | `capture.js` | The read-only function that runs inside the page to choose the content and build the snapshot |
 | `targets.js` | The read-only function that runs inside the page to list its links, buttons and supported form controls (for Suggest next action) |
-| `actions.js` | Pure logic for Suggest next action: control IDs, the bounded list, the prompt, and the strict reply validation (no DOM, no `chrome.*`) |
+| `actions.js` | Pure logic for Suggest next action: control IDs, the bounded list, the prompt, the strict reply validation, scroll limits and approval eligibility (no DOM, no `chrome.*`) |
+| `executor.js` | The only code that clicks, types or scrolls. Runs inside the page, once per approved action, and re-checks the control first |
 | `icons/` | Toolbar and header icons (16, 48, 128 px), made from `Mascot.png` on a black tile |
 | `fonts/` | Bundled Instrument Serif and Inter (SIL OFL), so no network font loading |
 | `Mascot.png` | Original mascot artwork (not loaded by the extension) |
@@ -257,6 +259,8 @@ node tests/make-action-fixtures.js && node tests/dump-targets.js   # fixtures ->
 node tests/targets.test.js      # what the page-side capture returned (privacy, names, bounds, DOM changes)
 node tests/proposal.test.js     # fake model reply -> validation -> live recheck -> what is displayed
 node tests/positions.test.js     # control rectangles/centres, what is serialized to the model (no model call)
+node tests/exec.test.js          # approval + dispatch against a real headless-Chrome DOM (scripted model reply)
+node tests/exec-mutants.js       # breaks one safeguard at a time and checks exec.test.js notices
 node tests/action-model.test.js 5   # the local model's DECISIONS (rate per scenario)
 node tests/position-model.test.js 4 # the local model on positional goals ("bottom left", "the button")
 node tests/measure-prompt.js act_addremove "click the bottom left button" 3   # real prompt tokens for one fixture + goal
@@ -267,10 +271,10 @@ node tests/dump-captures.js <url> <name>       # capture a live page, then: node
 
 The capture and panel tests are deterministic. The model test is not: a small local model varies from run to
 run, so it prints how many of N runs passed. None of these run the installed extension.
-## Suggest next action (proposals only)
+## Suggest next action
 
-You type a goal ("search for red running shoes"), then click **Suggest next action**. Cloudy never performs the
-step. It shows it in words so you can judge it.
+You type a goal ("search for red running shoes"), then click **Suggest next action**. Cloudy shows the proposed
+step in words so you can judge it. It performs nothing unless you approve that one proposal (below).
 
 ### What is captured
 
@@ -330,7 +334,39 @@ proposed control still present with the same name, state and place in the page, 
 unchanged. Scrolling does not count as a change. If any of that fails, or the page cannot be read again, the
 proposal is shown as **stale / freshness not established** and you are asked to capture again. Switching tabs,
 navigating, reloading or closing the tab clears a displayed proposal. A DOM change that happens *after* a proposal
-is displayed is not noticed until the next capture, so a future Execute step must recheck immediately before acting.
+is displayed is not noticed until the next capture, which is why Approve checks the page again right before acting.
+
+### Approving one action
+
+Approve is offered only for a proposal that is valid, fresh, and a click, type or scroll that is actually possible.
+Nothing is offered for `ask_user` or `cannot`, for a blocked or invalid proposal, for a control that is offscreen
+(scroll first; a scroll needs its own approval), or for a scroll that has nowhere to go.
+
+- **Blocked vs invalid.** A reply that does not fit the format (made-up or stale ID, click on a text field) is shown as
+  *invalid format*. A well-formed reply that Cloudy's rules refuse (disabled, read-only, password/credential or payment
+  field, unsupported control, consequential names such as **Delete**, secret-shaped text, words not in your goal) is
+  shown as *blocked by a rule*. The consequential-name block is unchanged: Delete stays blocked.
+- **One approval, one action.** The approval is bound to the exact action, control, text or direction, tab and
+  document. It is consumed before anything runs, so repeated clicks cannot run it twice. A new proposal, a tab switch,
+  a navigation, closing the tab or a stale page ends it.
+- **Checked again right before acting.** Cloudy reads the page again and requires: same tab, address and document;
+  the same *element* (found by an identity key that survives re-capture, not by its `E` number, and never a look-alike);
+  unchanged name, kind and state; the same list of controls; the safety rules applied again to the control as it is
+  now; and the control in view. Otherwise it refuses and says why. `executor.js` then checks the same element again in
+  the same step as the action, so nothing can change in between.
+- **Click** calls the element's own `click()`. **Type** selects the field's content without reading it and inserts the
+  approved text as typing does (an `input` event). It never reads the previous value, never presses Enter and never
+  submits the form. **Scroll** moves only the page's own scroller by at most 80% of the viewport height (800 px max),
+  after checking how much room is left in that direction. Nested scroll containers are not supported.
+- **Script-made events.** These are not real input, so some sites ignore them. The action is reported as *dispatched*,
+  not as effective.
+- **After the action.** Cloudy captures the page again and shows the controls now on the page, then stops. It does not
+  ask the model for another step. The result keeps three things apart: *action dispatched* (or not, and why),
+  *effect observed* (only what the new capture shows: a changed control count, a navigation, the new scroll position),
+  and *goal verified* (always "no": Cloudy does not judge goals). It does not claim a typed value was verified, because
+  values are never read back.
+- **Stop** cancels an approved action only before it is dispatched. It cannot undo one that has already run; then it
+  only skips the follow-up capture.
 
 ### Limits to keep in mind
 

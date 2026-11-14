@@ -91,6 +91,7 @@ function normalizeTargetCapture(raw) {
     const rect = normalizeRect(t.rect);
     targets.push({
       n: t.n,
+      key: Number.isInteger(t.key) && t.key > 0 && t.key < 1e9 ? t.key : 0, // element identity, stable across captures
       kind: t.kind,
       inputType: INPUT_TYPE_SET.has(t.inputType) ? t.inputType : "",
       name: actClip(typeof t.name === "string" ? t.name.replace(/\s+/g, " ").trim() : "", 80),
@@ -401,13 +402,23 @@ const wordsOf = (s) => (String(s).toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'â
 //   { kind: "malformed", reasons }
 //   { kind: "rejected", proposal, reasons, checks }   well-formed, but not an acceptable proposal
 //   { kind: "valid", proposal, record, checks, warnings }   valid target/action FORMAT (not "safe", not "correct")
-// `ctx` = { version, records }.
+// `ctx` = { version, records, scroll }. A rejection also carries `blocks` (refused by Cloudy's
+// rules) and `invalid` (not a valid format), which together are `reasons`.
 function validateActionReply(text, goal, ctx) {
   const parsed = parseActionReply(text);
   if (!parsed.ok) return { kind: "malformed", reasons: parsed.reasons };
   const p = parsed.proposal;
   const checks = [{ ok: true, text: "Reply has exactly the expected fields, with an allowed action." }];
   const reasons = [];
+  // Two kinds of rejection, told apart in the UI. INVALID = the reply does not fit the format
+  // (bad or stale ID, wrong action for the control). BLOCKED = the reply is well-formed but
+  // Cloudy's own rules refuse it (unsupported, disabled, read-only, credential/payment-looking,
+  // consequential, secret-shaped or invented text).
+  const blocks = new Set();
+  const block = (text) => {
+    reasons.push(text);
+    blocks.add(text);
+  };
   const warnings = [];
   if (parsed.ignored.length > 0) warnings.push(`The model also filled in ${parsed.ignored.map((k) => `"${k}"`).join(", ")}, which this action does not use. It was ignored.`);
   if (parsed.shortened.includes("rationale")) warnings.push(`The model's rationale was longer than ${RATIONALE_SHOWN_MAX} characters and was shortened.`);
@@ -429,25 +440,26 @@ function validateActionReply(text, goal, ctx) {
     if (record && record.shown) {
       checks.push({ ok: true, text: `${record.id} is one of the controls shown to the model (${ctx.version}).` });
       const s = record.support;
-      if (s.unsupported) reasons.push(`${record.id} is unsupported in this milestone: ${s.unsupported}.`);
-      else if (record.disabled) reasons.push(`${record.id} is disabled.`);
+      if (s.unsupported) block(`${record.id} is unsupported in this milestone: ${s.unsupported}.`);
+      else if (record.disabled) block(`${record.id} is disabled.`);
       else if (p.action === "click" && !s.canClick) {
         reasons.push(record.kind === "text-field" || record.kind === "text-area" ? `${record.id} is a text field: it is filled with "type", not clicked.` : `${record.id} (${kindWords(record)}) cannot be clicked in this milestone.`);
       } else if (p.action === "type" && !s.canType) {
-        reasons.push(record.readOnly ? `${record.id} is read-only.` : `${record.id} is a ${kindWords(record)}: text can only be typed into a text field or text area.`);
+        if (record.readOnly) block(`${record.id} is read-only.`);
+        else reasons.push(`${record.id} is a ${kindWords(record)}: text can only be typed into a text field or text area.`);
       } else {
         checks.push({ ok: true, text: `${p.action === "click" ? "Click" : "Typing"} fits a ${kindWords(record)}, and it is enabled${p.action === "type" ? " and not read-only" : ""}.` });
       }
       if (p.action === "click" && CONSEQUENTIAL_RE.test(record.name)) {
-        reasons.push(`${record.id} has a name that suggests a consequential action (${JSON.stringify(record.name)}). Consequential actions are not supported in this milestone.`);
+        block(`${record.id} has a name that suggests a consequential action (${JSON.stringify(record.name)}). Consequential actions are not supported in this milestone.`);
       }
       if (p.action === "type") {
-        if (SECRET_NAME_RE.test(record.name)) reasons.push(`${record.id} looks like a credential or payment field; Cloudy will not propose entering secrets.`);
+        if (SECRET_NAME_RE.test(record.name)) block(`${record.id} looks like a credential or payment field; Cloudy will not propose entering secrets.`);
         const shape = secretShape(p.text);
-        if (shape) reasons.push(`The text to type was refused: ${shape}.`);
+        if (shape) block(`The text to type was refused: ${shape}.`);
         const goalWords = new Set(wordsOf(goal));
         const extra = wordsOf(p.text).filter((w) => !goalWords.has(w));
-        if (extra.length > 0) reasons.push(`The text to type contains words that are not in your goal (${extra.slice(0, 3).map((w) => JSON.stringify(w)).join(", ")}); only text from your goal may be typed.`);
+        if (extra.length > 0) block(`The text to type contains words that are not in your goal (${extra.slice(0, 3).map((w) => JSON.stringify(w)).join(", ")}); only text from your goal may be typed.`);
         else if (wordsOf(p.text).length === 0) reasons.push("The text to type has no words.");
         else checks.push({ ok: true, text: "Every word of the text to type appears in your goal." });
       }
@@ -468,9 +480,52 @@ function validateActionReply(text, goal, ctx) {
   }
 
   if (reasons.length > 0) {
-    return { kind: "rejected", proposal: p, reasons, checks: checks.filter((c) => c.ok) };
+    return {
+      kind: "rejected", proposal: p, reasons, checks: checks.filter((c) => c.ok),
+      blocks: reasons.filter((r) => blocks.has(r)), invalid: reasons.filter((r) => !blocks.has(r)),
+    };
   }
   return { kind: "valid", proposal: p, record, checks, warnings };
+}
+
+// ---- Approved execution: the pure parts (nothing here touches the page) ---------------
+const SCROLL_STEP_FRACTION = 0.8; // of the viewport height ...
+const SCROLL_STEP_MAX = 800; // ... and never more than this many CSS pixels
+const STEP_VIEWPORT_OK = new Set(["in-view", "partly-in-view"]);
+
+// How far one approved scroll may go. Rejects impossible scrolls (nothing left in that
+// direction) instead of pretending. `scroll` = { top, max } of the page's own scroller.
+function scrollPlan(direction, scroll, viewport) {
+  if (direction !== "up" && direction !== "down") return { ok: false, remaining: 0, reason: "the scroll direction is not up or down" };
+  const top = scroll && Number.isFinite(scroll.top) ? scroll.top : 0;
+  const max = scroll && Number.isFinite(scroll.max) ? scroll.max : 0;
+  if (max < 1) return { ok: false, remaining: 0, reason: "the page does not scroll (its own scroller has no room)" };
+  const remaining = direction === "down" ? max - top : top;
+  if (!(remaining >= 1)) return { ok: false, remaining: 0, reason: direction === "down" ? "the page is already at the bottom" : "the page is already at the top" };
+  const vh = viewport && Number.isFinite(viewport.h) ? viewport.h : 0;
+  const step = Math.max(1, Math.min(Math.floor(vh * SCROLL_STEP_FRACTION), SCROLL_STEP_MAX, Math.floor(remaining)));
+  return { ok: true, step, remaining: Math.floor(remaining) };
+}
+
+// May this displayed proposal be offered for approval? Only a valid, fresh click, type or scroll
+// qualifies. `freshness.current` is the SAME element as seen in the fresh page read (matched by
+// its identity key, not by its per-capture number).
+//   { eligible: true } | { eligible: false, reason, silent? }   (silent: nothing to explain, e.g. ask_user)
+function executionEligibility(result, freshness) {
+  if (!result || result.kind !== "valid") return { eligible: false, silent: true, reason: "" };
+  const p = result.proposal;
+  if (p.action !== "click" && p.action !== "type" && p.action !== "scroll") return { eligible: false, silent: true, reason: "" };
+  if (!freshness || freshness.state !== "fresh") return { eligible: false, reason: "the page could not be confirmed unchanged" };
+  if (p.action === "scroll") {
+    const plan = scrollPlan(p.direction, freshness.scroll, freshness.viewport);
+    return plan.ok ? { eligible: true } : { eligible: false, reason: `this scroll is not possible: ${plan.reason}` };
+  }
+  const rec = result.record;
+  const cur = freshness.current;
+  if (!rec || !(rec.key > 0)) return { eligible: false, reason: "the control has no stable identity in this capture" };
+  if (!cur || cur.key !== rec.key) return { eligible: false, reason: "the control on the page now is a different element from the one that was captured" };
+  if (!STEP_VIEWPORT_OK.has(cur.viewport)) return { eligible: false, reason: "the control is not in view. Scroll first (a scroll needs its own approval)" };
+  return { eligible: true };
 }
 
 // One plain sentence for the person reading it.
