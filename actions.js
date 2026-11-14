@@ -7,7 +7,9 @@
 // say that the step is correct for the goal, relevant, or harmless.
 
 // ---- Reply contract ------------------------------------------------------------
-const ACTION_NAMES = ["click", "type", "scroll", "ask_user", "cannot"];
+// "search" is ONE operation: fill the search field and submit it (one approval, a fixed sequence).
+// "type" only fills the field and never submits.
+const ACTION_NAMES = ["click", "type", "search", "scroll", "ask_user", "cannot"];
 const ACTION_KEYS = ["rationale", "action", "target_id", "text", "direction", "question", "reason"];
 // Flat on purpose: every field is always present, unused ones are "". The keys are
 // generated in this order, so the model writes its one-sentence rationale BEFORE it
@@ -34,7 +36,8 @@ const RATIONALE_SHOWN_MAX = 300;
 const RATIONALE_HARD_MAX = 2000;
 
 // ---- Budgets (separate from the 4000-character Q&A capture budget) -------------
-const TARGET_LIMITS = { maxTargets: 150, scanCap: 600, nameMax: 80, urlMax: 200, titleMax: 150 };
+const TARGET_LIMITS = { maxTargets: 150, scanCap: 600, nameMax: 80, urlMax: 200, titleMax: 150, valueMax: 200 };
+const VALUE_SHOWN_MAX = 100; // characters of a field's value shown to the model (the full value, up to valueMax, stays local)
 const ACTION_TARGET_BUDGET_CHARS = 3200; // the TARGETS list sent to the model
 const ACTION_CONTEXT_BUDGET_CHARS = 900; // title, address, coverage notes, short excerpt
 
@@ -77,6 +80,51 @@ function rectCentre(rect) {
   return [Math.round(rect.x + rect.w / 2), Math.round(rect.y + rect.h / 2)];
 }
 
+// Ordinary form state (value of a plain text field, checkbox state, shown option) and the
+// search path of a search field. The page said what it read; here it is re-checked, and a
+// value is dropped again if the control is a secret or the value has a secret's shape.
+const SEARCH_VIA_SET = new Set(["control", "form", "none", "ambiguous"]);
+function normalizeFormState(t, textish, sensitive) {
+  let value = null;
+  let valueLen = 0;
+  let valueWithheld = false;
+  if (textish && !sensitive) {
+    if (t.valueWithheld === true) {
+      valueWithheld = true;
+      value = "";
+    } else if (typeof t.value === "string") {
+      const clean = t.value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, TARGET_LIMITS.valueMax);
+      if (secretShape(clean)) {
+        valueWithheld = true;
+        value = "";
+      } else {
+        value = clean;
+        valueLen = Math.max(clean.length, actInt(t.valueLen, 1000000));
+      }
+    }
+  }
+  const checked = (t.kind === "checkbox" || t.kind === "radio") && typeof t.checked === "boolean" ? t.checked : null;
+  const selected = t.kind === "select-menu" && !sensitive && Array.isArray(t.selected)
+    ? t.selected.slice(0, 3).map((x) => actClip(typeof x === "string" ? x.replace(/\s+/g, " ").trim() : "", 60))
+    : null;
+  let search = null;
+  const s = t.search;
+  if (t.kind === "text-field" && !sensitive && s && typeof s === "object" && s.field === true && SEARCH_VIA_SET.has(s.via)) {
+    const sub = s.submit && typeof s.submit === "object" && Number.isInteger(s.submit.key) && s.submit.key > 0 && typeof s.submit.signature === "string" && /^[0-9a-f]{8}$/.test(s.submit.signature)
+      ? { key: s.submit.key, name: actClip(typeof s.submit.name === "string" ? s.submit.name.replace(/\s+/g, " ").trim() : "", 80), signature: s.submit.signature }
+      : null;
+    const via = (s.via === "control" && !sub) ? "none" : s.via;
+    search = {
+      field: true,
+      via,
+      reason: actClip(typeof s.reason === "string" ? s.reason : "", 140),
+      submit: via === "control" ? sub : null,
+      formKey: Number.isInteger(s.formKey) && s.formKey > 0 && s.formKey < 1e9 ? s.formKey : 0,
+    };
+  }
+  return { value, valueLen, valueWithheld, checked, selected, search };
+}
+
 // The page controls the text of its own labels, so re-check everything that came
 // back instead of trusting the shape. Returns a clean copy, or null.
 function normalizeTargetCapture(raw) {
@@ -89,8 +137,12 @@ function normalizeTargetCapture(raw) {
     if (!TARGET_KIND_SET.has(t.kind) || typeof t.signature !== "string" || !/^[0-9a-f]{8}$/.test(t.signature)) continue;
     seen.add(t.n);
     const rect = normalizeRect(t.rect);
+    const sensitive = t.sensitive === true;
+    const textish = t.kind === "text-field" || t.kind === "text-area";
+    const state = normalizeFormState(t, textish, sensitive);
     targets.push({
       n: t.n,
+      ...state,
       key: Number.isInteger(t.key) && t.key > 0 && t.key < 1e9 ? t.key : 0, // element identity, stable across captures
       kind: t.kind,
       inputType: INPUT_TYPE_SET.has(t.inputType) ? t.inputType : "",
@@ -149,6 +201,48 @@ function targetSupport(t) {
     unsupported,
     canClick: usable && CLICK_KINDS.has(t.kind),
     canType: usable && !t.readOnly && (t.kind === "text-field" || t.kind === "text-area"),
+    // A search field that Cloudy can also SUBMIT safely (an associated control, or requestSubmit on a search form).
+    canSearch: usable && !t.readOnly && t.kind === "text-field" && !!t.search && (t.search.via === "control" || t.search.via === "form"),
+  };
+}
+
+// How a search field is submitted, in words (also used to explain why one is not offered).
+function searchPathWords(rec) {
+  const s = rec.search;
+  if (!s) return "";
+  if (s.via === "control") return `submits via the ${JSON.stringify(s.submit.name || "(unnamed)")} button`;
+  if (s.via === "form") return "submits via its search form (requestSubmit, so the browser's own validation applies)";
+  return `NO safe way to submit it: ${s.reason || "unknown"}`;
+}
+
+// The ONE operation behind a "search" proposal: a fixed sequence, approved once.
+// Typing is skipped when the field already holds exactly the query.
+function searchPlan(rec, text) {
+  const skipFill = rec.value !== null && !rec.valueWithheld && rec.valueLen === text.length && rec.value === text;
+  const via = rec.search ? rec.search.via : "none";
+  const submitWords = via === "control" ? `click the ${JSON.stringify(rec.search.submit.name || "(unnamed)")} button` : "submit the search form (requestSubmit)";
+  return {
+    skipFill,
+    via,
+    steps: [skipFill ? "the field already holds exactly this query, so it is not retyped" : `fill the search field with ${JSON.stringify(text)}`, submitWords],
+  };
+}
+
+// Why a control needs an explicit confirmation, and what Cloudy actually knows about it. The name
+// only triggers the question; it is never used to claim a consequence.
+function consequenceInfo(rec) {
+  const m = CONSEQUENTIAL_RE.exec(rec.name || "");
+  if (!m) return null;
+  const known = rec.submit
+    ? "Known: this button submits a form on the page. What the site does with that form is not known to Cloudy."
+    : rec.kind === "link"
+      ? "Known: this is a link. Where it leads is not shown to Cloudy."
+      : `Known: this is a ${kindWords(rec)} on the page. What the page does when it is used is not known to Cloudy.`;
+  return {
+    word: m[0],
+    reason: `Its name contains ${JSON.stringify(m[0])}, so Cloudy asks you to confirm separately.`,
+    known,
+    unknown: "Unknown: the real effect. Cloudy does not infer it from the name, so do not treat it as a prediction.",
   };
 }
 
@@ -207,6 +301,15 @@ function targetLine(rec) {
   if (rec.support.unsupported) parts.push(`UNSUPPORTED (${rec.support.unsupported})`);
   if (rec.disabled) parts.push("DISABLED");
   if (rec.readOnly) parts.push("READ-ONLY");
+  // Ordinary state (secrets never get this far: they are not read, see targets.js).
+  if (rec.valueWithheld) parts.push("value: withheld");
+  else if (rec.value !== null) {
+    const shown = rec.value.length > VALUE_SHOWN_MAX ? `${rec.value.slice(0, VALUE_SHOWN_MAX - 1)}…` : rec.value;
+    parts.push(`value: ${JSON.stringify(shown)}${rec.valueLen > rec.value.length || rec.value.length > VALUE_SHOWN_MAX ? ` (${rec.valueLen} characters)` : ""}`);
+  }
+  if (rec.checked !== null) parts.push(rec.checked ? "checked" : "not checked");
+  if (rec.selected !== null) parts.push(rec.selected.length > 0 ? `selected: ${rec.selected.map((x) => JSON.stringify(x)).join(", ")}` : "selected: (nothing)");
+  if (rec.search) parts.push(rec.support.canSearch ? `SEARCH FIELD (${searchPathWords(rec)})` : `looks like a search field, but ${searchPathWords(rec)}`);
   if (rec.dupTotal > 1) parts.push(`same ${rec.name === "" ? "(missing) name" : "name"} as ${rec.dupTotal - 1} other control(s), this is ${rec.dupIndex} of ${rec.dupTotal}`);
   return parts.join(" | ");
 }
@@ -215,7 +318,16 @@ function targetLine(rec) {
 // offscreen, then disabled/unsupported). IDs keep their document-order numbers.
 function packTargets(records, budget) {
   const all = [...records.values()];
-  const rank = (r) => ((r.support.canClick || r.support.canType) ? (isOffscreen(r.viewport) ? 1 : 0) : 2);
+  // Search fields and the controls that submit them are pinned first, so they cannot be cut by the
+  // size limit while less relevant controls are kept.
+  const pinned = new Set();
+  for (const r of all) {
+    if (r.support.canSearch) {
+      pinned.add(r.key);
+      if (r.search.submit) pinned.add(r.search.submit.key);
+    }
+  }
+  const rank = (r) => (pinned.has(r.key) && r.key > 0 ? -1 : (r.support.canClick || r.support.canType) ? (isOffscreen(r.viewport) ? 1 : 0) : 2);
   const ordered = all.slice().sort((a, b) => rank(a) - rank(b) || a.n - b.n);
   const total = all.length;
   const reserve = 200; // the closing omission note
@@ -248,10 +360,12 @@ const ACTION_SYSTEM_PROMPT = [
   "- Actions (choose exactly one):",
   "  click: press a link, button, checkbox, radio button or disclosure. Never click a text field; use type.",
   '  type: enter text into an enabled, editable text field or text area. "text" may contain only words that appear in the user\'s goal. Never type passwords, codes, card or ID numbers or other secrets, and never invent personal data. If the goal does not contain the text to type, use ask_user.',
-  '  scroll: direction "up" or "down", when the control you need is not listed or is marked OFFSCREEN. Offscreen controls cannot be clicked until the page is scrolled.',
+  '  search: ONE operation that fills a listed SEARCH FIELD with "text" and submits it; the person approves it once. Use it ONLY when the goal itself asks to search for, find or look up something (it uses a word like search, find or look up) and the TARGETS list has a "SEARCH FIELD (submits via ...)" control. A goal such as "track my parcel" or "open the menu" does not ask to search: do not turn it into a search. "text" is only the query, using only words from the goal. If the field already shows exactly that query, still use search (it is not retyped). If the goal only says to type, enter or fill something, use type: type never submits.',
+  '  scroll: direction "up" or "down", when the control you need is not listed or is marked OFFSCREEN. Offscreen controls cannot be clicked until the page is scrolled. Do not choose a scroll that is impossible (the page is already at that end or does not scroll).',
   "  ask_user: ask ONE short question when the goal is ambiguous or needs information you were not given.",
   "  cannot: say briefly why the listed controls cannot advance the goal (for example it needs an UNSUPPORTED control, or nothing listed fits).",
-  "- Do not choose controls marked DISABLED, READ-ONLY or UNSUPPORTED. Do not choose controls that buy, pay, order, delete, remove, send, post, publish, confirm, subscribe, sign out or do something similarly consequential: reply cannot or ask_user instead.",
+  "- Do not choose controls marked DISABLED, READ-ONLY or UNSUPPORTED. A control that buys, pays, orders, deletes, removes, sends, posts, publishes, confirms, subscribes, signs out or is similarly consequential may be proposed ONLY when the goal clearly asks for exactly that; the person is then asked to confirm it separately. If the goal does not clearly ask for it, reply ask_user instead. Never guess what such a control will do from its name.",
+  '- Text fields show their current value (value: "..."), checkboxes and radio buttons show checked or not checked, and selects show what is selected. Use that state: do not toggle a box that already has the wanted state. When the goal is to search for X and the search field already shows exactly X, still choose search (the panel then skips the typing and only submits); do not click the search button yourself. A field marked "value: withheld", or without a value, is not available to you; never ask for or guess it.',
   '- A name marked "placeholder" is a weak hint, not a real label. Several controls can share a name; tell them apart by ID, region and position.',
   '- Position words in the goal (left, right, top, bottom, first, last, row, corner, next to, above, below) refer to the layout. Decide them from the [x,y] centres, relative to the other controls that fit the rest of the goal (the named control, or the kind of control the goal says): smaller x is further left, larger y is lower, and centres whose y values are within a few pixels of each other are one row. Positions are relative to those other candidates, not to the viewport edges or the middle of the screen: the lowest candidate is "bottom" even if it is far from the bottom edge. A corner is a row plus a side: "bottom left" is the lowest row, then the smallest x in that row; "top right" is the highest row, then the largest x in that row. In "rationale", name the controls and the [x,y] values you compared. Answer with the chosen control\'s ID, never with coordinates.',
   '- If the goal does not single out one control, use ask_user with one short question instead of guessing which one the user means. That includes a goal that names only a kind ("click the button") when more than one such control is listed, and a position that matches several controls equally. Use scroll only when the control you need is missing from the list or OFFSCREEN, never because a positional request could not be resolved.',
@@ -337,8 +451,8 @@ function parseActionReply(text) {
   for (const k of ACTION_KEYS) {
     if (/[\u0000-\u001f\u007f]/.test(value[k])) reasons.push(`field "${k}" contains a control or line-break character`);
   }
-  const needs = { click: ["target_id"], type: ["target_id", "text"], scroll: ["direction"], ask_user: ["question"], cannot: ["reason"] };
-  const uses = { click: ["target_id"], type: ["target_id", "text"], scroll: ["direction"], ask_user: ["question"], cannot: ["reason"] };
+  const needs = { click: ["target_id"], type: ["target_id", "text"], search: ["target_id", "text"], scroll: ["direction"], ask_user: ["question"], cannot: ["reason"] };
+  const uses = { click: ["target_id"], type: ["target_id", "text"], search: ["target_id", "text"], scroll: ["direction"], ask_user: ["question"], cannot: ["reason"] };
   if (ACTION_NAMES.includes(value.action)) {
     for (const k of needs[value.action]) {
       if (value[k].trim() !== "") continue;
@@ -373,6 +487,13 @@ function parseActionReply(text) {
 
 const ACTION_ID_PATTERN = /^a\d+:E\d+$/;
 const CONSEQUENTIAL_RE = /\b(buy|buying|purchase|pay|payment|checkout|check out|place (an? )?order|order now|delete|erase|remove account|close account|send|publish|post|confirm|unsubscribe|sign out|log out|logout|donate|transfer|withdraw|book now|reserve|cancel (my )?(subscription|order|account|booking)|install|authorize)\b/i;
+// The goal itself must ask to search before a "search" reply is accepted ("type X" never becomes a search).
+// "search box / search bar / search field" name a control, not an intent, so they are ignored:
+// "type shoes into the search box" is NOT a request to search.
+function goalAsksToSearch(goal) {
+  const stripped = String(goal).replace(/\bsearch[\s-]*(box|bar|field|input|form|text(box)?)\b/gi, " ");
+  return /\b(search(ing)?|find|look(ing)? (up|for)|query)\b/i.test(stripped);
+}
 const SECRET_NAME_RE = /pass(word|wd|code)|\bpin\b|\botp\b|one.?time|verification code|security code|\bcvv\b|\bcvc\b|card number|secret|token|api.?key|\bssn\b|social security/i;
 
 function luhn(digits) {
@@ -426,7 +547,8 @@ function validateActionReply(text, goal, ctx) {
   if (p.rationale.trim() === "") warnings.push("The model gave no reason for this step.");
   let record = null;
 
-  if (p.action === "click" || p.action === "type") {
+  let confirm = null; // set when the control needs an explicit confirmation (never a rejection by name)
+  if (p.action === "click" || p.action === "type" || p.action === "search") {
     const id = p.target_id.trim();
     if (!ACTION_ID_PATTERN.test(id)) {
       reasons.push(`"${actClip(id, 40)}" is not a valid control ID.`);
@@ -444,16 +566,23 @@ function validateActionReply(text, goal, ctx) {
       else if (record.disabled) block(`${record.id} is disabled.`);
       else if (p.action === "click" && !s.canClick) {
         reasons.push(record.kind === "text-field" || record.kind === "text-area" ? `${record.id} is a text field: it is filled with "type", not clicked.` : `${record.id} (${kindWords(record)}) cannot be clicked in this milestone.`);
-      } else if (p.action === "type" && !s.canType) {
+      } else if ((p.action === "type" || p.action === "search") && !s.canType) {
         if (record.readOnly) block(`${record.id} is read-only.`);
         else reasons.push(`${record.id} is a ${kindWords(record)}: text can only be typed into a text field or text area.`);
       } else {
-        checks.push({ ok: true, text: `${p.action === "click" ? "Click" : "Typing"} fits a ${kindWords(record)}, and it is enabled${p.action === "type" ? " and not read-only" : ""}.` });
+        checks.push({ ok: true, text: `${p.action === "click" ? "Click" : p.action === "search" ? "Searching" : "Typing"} fits a ${kindWords(record)}, and it is enabled${p.action === "click" ? "" : " and not read-only"}.` });
       }
-      if (p.action === "click" && CONSEQUENTIAL_RE.test(record.name)) {
-        block(`${record.id} has a name that suggests a consequential action (${JSON.stringify(record.name)}). Consequential actions are not supported in this milestone.`);
+      // A consequential-looking name no longer rejects the proposal. It requires a separate, explicit
+      // confirmation that says what is known and what is not.
+      if (p.action === "click" && !reasons.length) confirm = consequenceInfo(record);
+      if (confirm) warnings.push(`${record.id} needs an explicit confirmation before it can run: ${confirm.reason}`);
+      if (p.action === "search") {
+        if (!goalAsksToSearch(goal)) block("Your goal does not ask to search, so this is not accepted as a search. Typing alone never submits; use type for that.");
+        if (!record.search) block(`${record.id} is not identified as a search field.`);
+        else if (record.search.via !== "control" && record.search.via !== "form") block(`${record.id} looks like a search field, but it has no supported way to submit it: ${record.search.reason || "unknown"}.`);
+        else checks.push({ ok: true, text: `Search path found before approval: ${searchPathWords(record)}.` });
       }
-      if (p.action === "type") {
+      if (p.action === "type" || p.action === "search") {
         if (SECRET_NAME_RE.test(record.name)) block(`${record.id} looks like a credential or payment field; Cloudy will not propose entering secrets.`);
         const shape = secretShape(p.text);
         if (shape) block(`The text to type was refused: ${shape}.`);
@@ -472,10 +601,11 @@ function validateActionReply(text, goal, ctx) {
     }
   } else if (p.action === "scroll") {
     checks.push({ ok: true, text: `Direction "${p.direction}" is allowed.` });
+    // An impossible scroll is rejected here, not shown as valid with a warning.
     if (ctx.scroll) {
-      if (p.direction === "down" && ctx.scroll.max > 0 && ctx.scroll.top >= ctx.scroll.max - 1) warnings.push("The page already appears to be scrolled to the bottom.");
-      if (p.direction === "up" && ctx.scroll.top <= 0) warnings.push("The page already appears to be scrolled to the top.");
-      if (ctx.scroll.max === 0) warnings.push("The page does not appear to be scrollable.");
+      const plan = scrollPlan(p.direction, ctx.scroll, ctx.viewport);
+      if (!plan.ok) block(`This scroll is not possible: ${plan.reason}.`);
+      else checks.push({ ok: true, text: `There is room to scroll ${p.direction} (${plan.remaining} px remain; one step is at most ${plan.step} px).` });
     }
   }
 
@@ -485,7 +615,7 @@ function validateActionReply(text, goal, ctx) {
       blocks: reasons.filter((r) => blocks.has(r)), invalid: reasons.filter((r) => !blocks.has(r)),
     };
   }
-  return { kind: "valid", proposal: p, record, checks, warnings };
+  return { kind: "valid", proposal: p, record, checks, warnings, confirm };
 }
 
 // ---- Approved execution: the pure parts (nothing here touches the page) ---------------
@@ -514,7 +644,7 @@ function scrollPlan(direction, scroll, viewport) {
 function executionEligibility(result, freshness) {
   if (!result || result.kind !== "valid") return { eligible: false, silent: true, reason: "" };
   const p = result.proposal;
-  if (p.action !== "click" && p.action !== "type" && p.action !== "scroll") return { eligible: false, silent: true, reason: "" };
+  if (p.action !== "click" && p.action !== "type" && p.action !== "search" && p.action !== "scroll") return { eligible: false, silent: true, reason: "" };
   if (!freshness || freshness.state !== "fresh") return { eligible: false, reason: "the page could not be confirmed unchanged" };
   if (p.action === "scroll") {
     const plan = scrollPlan(p.direction, freshness.scroll, freshness.viewport);
@@ -525,7 +655,19 @@ function executionEligibility(result, freshness) {
   if (!rec || !(rec.key > 0)) return { eligible: false, reason: "the control has no stable identity in this capture" };
   if (!cur || cur.key !== rec.key) return { eligible: false, reason: "the control on the page now is a different element from the one that was captured" };
   if (!STEP_VIEWPORT_OK.has(cur.viewport)) return { eligible: false, reason: "the control is not in view. Scroll first (a scroll needs its own approval)" };
+  if (p.action === "search") {
+    if (!sameSearchPath(rec.search, cur.search)) return { eligible: false, reason: "the way to submit the search changed since the capture" };
+    if (cur.value !== rec.value || cur.valueLen !== rec.valueLen) return { eligible: false, reason: "the search box's content changed since the capture" };
+  }
   return { eligible: true };
+}
+
+// The same submission path? (identity keys and signatures, never the wording.)
+function sameSearchPath(a, b) {
+  if (!a || !b || a.via !== b.via || a.formKey !== b.formKey) return false;
+  if (a.via !== "control" && a.via !== "form") return false;
+  if (a.via === "form") return true;
+  return !!a.submit && !!b.submit && a.submit.key === b.submit.key && a.submit.signature === b.submit.signature;
 }
 
 // One plain sentence for the person reading it.
@@ -536,6 +678,11 @@ function describeProposal(p, record) {
   switch (p.action) {
     case "click": return `Click the ${target}.`;
     case "type": return `Type ${JSON.stringify(p.text)} into the ${target}.`;
+    case "search": {
+      if (!record || !record.search) return `Search for ${JSON.stringify(p.text)} using the ${target}.`;
+      const plan = searchPlan(record, p.text);
+      return `Search for ${JSON.stringify(p.text)} using the ${target}: ${plan.steps[0]}, then ${plan.steps[1]}.`;
+    }
     case "scroll": return `Scroll ${p.direction}.`;
     case "ask_user": return `Ask you: ${p.question}`;
     case "cannot": return `Cannot proceed: ${p.reason}`;

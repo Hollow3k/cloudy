@@ -19,12 +19,18 @@
 // the page itself, and the page cannot see the isolated world.
 //
 // Privacy rules (the same spirit as capture.js, stricter for form controls):
-//  - It never reads .value (or the value attribute) of ANY input, textarea or
-//    select, never reads contenteditable text, never reads autofill contents,
-//    and never checks whether a field is empty. Names come only from
-//    author-written markup: aria-labelledby, aria-label, <label>, visible text
-//    of buttons/links, img alt, svg <title>, the title attribute, and (flagged
-//    as weak) the placeholder.
+//  - ORDINARY form state is read: the current text of a plain text field or
+//    textarea, whether a checkbox/radio is checked, and which option a select
+//    shows. SECRETS are excluded BEFORE anything is read: a control that is a
+//    password field, or is identified as a credential, payment detail, CVV or
+//    authentication code by its type, name, id, label, aria-label, placeholder,
+//    title or autocomplete, never has its value touched (the value is not read,
+//    not returned, not shown). A value that is read but has the shape of a card
+//    number or token is dropped inside the page, before it is returned. File
+//    pickers, other input types, contenteditable text and autofill are never read.
+//    Names come only from author-written markup: aria-labelledby, aria-label,
+//    <label>, visible text of buttons/links, img alt, svg <title>, the title
+//    attribute, and (flagged as weak) the placeholder.
 //  - Hidden controls are left out and only counted.
 //  - Password fields, file pickers, select menus, other input types and
 //    contenteditable regions are listed by safe metadata but marked
@@ -52,6 +58,11 @@ function captureActionTargets(limits) {
   const BUTTON_INPUT_TYPES = new Set(["button", "submit", "reset", "image"]);
   // Only a yes/no hint is returned; the attribute text itself never leaves the page.
   const SENSITIVE_RE = /pass(word|wd|code)?|pwd|otp|one.?time|2fa|mfa|cvv|cvc|csc|card.?(num|number)|cc.?(num|number|csc|exp)|ssn|social.?security|secret|token|api.?key|\bpin\b/i;
+  // The same idea for text a person reads (label, aria-label, placeholder, title). Word-bounded
+  // so "Passenger name" is not mistaken for a password field.
+  const SENSITIVE_TEXT_RE = /\b(pass(word|wd|code|phrase)?|pwd|otp|one[- ]?time|2fa|mfa|cvv|cvc|csc|security code|verification code|auth(entication)? code|card (number|no)|credit card|debit card|cc[- ]?(num|number|exp|csc)|expir(y|ation)|ssn|social security|secret|token|api[- ]?key|pin)\b/i;
+  const SEARCH_ATTR_RE = /search|query|\bfind\b|lookup|^q$|^s$/i;
+  const SEARCH_BUTTON_RE = /search|\bfind\b|lookup|look up|magnif|^go$/i;
   const SENSITIVE_AUTOCOMPLETE = /(^|\s)(cc-[a-z-]+|current-password|new-password|one-time-code)(\s|$)/i;
 
   // ---- Identity registry (isolated world only; see the header) ----
@@ -281,24 +292,138 @@ function captureActionTargets(limits) {
     return h.toString(16).padStart(8, "0");
   }
 
-  // Everything the panel is told about one listed control (no values, no text of fields).
+  function luhnOk(digits) {
+    let sum = 0;
+    let alt = false;
+    for (let i = digits.length - 1; i >= 0; i--) {
+      let d = digits.charCodeAt(i) - 48;
+      if (alt) { d *= 2; if (d > 9) d -= 9; }
+      sum += d;
+      alt = !alt;
+    }
+    return sum % 10 === 0;
+  }
+  // An ordinary field can still hold something secret-shaped (a card number pasted into "Notes").
+  // That is dropped here, in the page, before it can be returned.
+  function looksSecretValue(text) {
+    const digits = text.replace(/[\s-]/g, "");
+    if (/^\d{13,19}$/.test(digits) && luhnOk(digits)) return true;
+    if (/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(text)) return true;
+    return /[A-Za-z0-9_\-+/=]{24,}/.test(text) && !/\s/.test(text);
+  }
+
+  function isDisabledEl(c) {
+    return c.matches(":disabled") || c.getAttribute("aria-disabled") === "true" || !!c.closest("[inert]");
+  }
+
+  // A form counts as a search form only if the page says so (role/landmark, a type=search field,
+  // or a search-looking action/id/name). An arbitrary enclosing form never does.
+  function isSearchForm(form, el) {
+    if (form.matches('[role="search"]') || form.closest('[role="search"], search')) return true;
+    const bits = [form.getAttribute("action") || "", form.id || "", form.getAttribute("name") || "", form.getAttribute("aria-label") || ""].join(" ");
+    if (/search|query/i.test(bits)) return true;
+    if ((el.getAttribute("type") || "").toLowerCase() === "search") {
+      // A type=search box counts only when it is the form's ONLY data field (a filter box inside a
+      // larger settings or checkout form does not make that form a search form).
+      const others = Array.from(form.elements).filter((c) => c !== el && ((c.localName === "input" && !["hidden", "submit", "button", "image", "reset"].includes((c.type || "").toLowerCase())) || c.localName === "textarea" || c.localName === "select"));
+      return others.length === 0;
+    }
+    return false;
+  }
+
+  function isSearchField(el, cls, name) {
+    if (cls.kind !== "text-field" || (cls.inputType !== "search" && cls.inputType !== "text")) return false;
+    if (cls.inputType === "search") return true;
+    if (regionOf(el) === "search") return true;
+    const bits = [el.getAttribute("name"), el.id, el.getAttribute("aria-label"), el.getAttribute("placeholder"), name].filter(Boolean).join(" ");
+    return SEARCH_ATTR_RE.test(bits);
+  }
+
+  // How would a search typed into `el` be submitted? Only two supported paths:
+  //   "control": an associated, visible, enabled submit/search control (clicked like a person would)
+  //   "form":    form.requestSubmit() on an identified search form with no usable submit control
+  // (requestSubmit keeps native validation and the site's own submit handling. Never form.submit(),
+  // never a synthetic Enter, never a form that is not identified as a search form.)
+  function resolveSubmission(el) {
+    const no = (via, reason) => ({ via, reason, submit: null, formKey: 0 });
+    const asControl = (c, formKey) => {
+      const cls = classify(c);
+      if (cls === null) return no("none", "the submit control is not a button");
+      const d = describeListed(c, cls);
+      const key = keyOf(c);
+      world.byKey.set(key, new WeakRef(c));
+      return { via: "control", reason: "", submit: { key, name: d.name, signature: d.signature }, formKey };
+    };
+    const form = el.form;
+    if (form) {
+      if (!isSearchForm(form, el)) return no("none", "it is inside a form that is not identified as a search form");
+      const controls = Array.from(form.elements).filter((c) => (c.localName === "button" && c.type === "submit") || (c.localName === "input" && (c.type === "submit" || c.type === "image")));
+      const usable = controls.filter((c) => !isDisabledEl(c) && isRendered(c));
+      const formKey = keyOf(form);
+      if (usable.length === 1) return asControl(usable[0], formKey);
+      if (usable.length > 1) {
+        const named = usable.filter((c) => SEARCH_BUTTON_RE.test(accessibleName(c, "button", c.type || "").name));
+        return named.length === 1 ? asControl(named[0], formKey) : no("ambiguous", "the form has several submit buttons and none is clearly the search button");
+      }
+      if (controls.length > 0) return no("none", "its submit button is disabled or hidden");
+      return { via: "form", reason: "", submit: null, formKey };
+    }
+    const scope = el.closest('[role="search"], search');
+    if (!scope) return no("none", "it is not inside a form or a search landmark");
+    const buttons = Array.from(scope.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], input[type="image"]'))
+      .filter((c) => !isDisabledEl(c) && isRendered(c) && SEARCH_BUTTON_RE.test(accessibleName(c, "button", c.type || "").name));
+    return buttons.length === 1 ? asControl(buttons[0], 0) : no(buttons.length > 1 ? "ambiguous" : "none", buttons.length > 1 ? "several controls in the search area could be the search button" : "no search button was found in the search area");
+  }
+
+  // Everything the panel is told about one listed control. Values only for ordinary fields (see the header).
   function describeListed(el, cls) {
     const kind = cls.kind;
     const editable = kind === "text-field" || kind === "text-area" || kind === "password-field" || kind === "file-picker" || kind === "select-menu" || kind === "other-input";
     const { name, source } = accessibleName(el, kind, cls.inputType || "");
     const disabled = el.matches(":disabled") || el.getAttribute("aria-disabled") === "true" || !!el.closest("[inert]");
     const readOnly = (kind === "text-field" || kind === "text-area") && (el.readOnly === true || el.getAttribute("aria-readonly") === "true");
+    // Decided from metadata ONLY, before any value is read.
     const sensitive =
       editable &&
       (SENSITIVE_AUTOCOMPLETE.test(el.getAttribute("autocomplete") || "") ||
         SENSITIVE_RE.test(el.getAttribute("name") || "") ||
-        SENSITIVE_RE.test(el.getAttribute("id") || ""));
+        SENSITIVE_RE.test(el.getAttribute("id") || "") ||
+        SENSITIVE_TEXT_RE.test(name) ||
+        SENSITIVE_TEXT_RE.test(el.getAttribute("aria-label") || "") ||
+        SENSITIVE_TEXT_RE.test(el.getAttribute("placeholder") || "") ||
+        SENSITIVE_TEXT_RE.test(el.getAttribute("title") || ""));
     const region = regionOf(el);
     const viewport = viewportStatus(el);
     const rect = rectOf(el);
     const destHash = kind === "link" && el.href ? hash(String(el.href)) : "";
     const signature = hash([kind, cls.inputType || "", name, source, disabled, readOnly, !!cls.submit, region, pathOf(el), destHash].join("\u0001"));
-    return { kind, inputType: cls.inputType || "", name, nameSource: source, disabled, readOnly, submit: !!cls.submit, sensitive, viewport, rect, region, signature };
+    // Ordinary state, never for a secret (the checks above came first).
+    const vmax = limits.valueMax || 200;
+    let value = null;
+    let valueLen = 0;
+    let valueWithheld = false;
+    if ((kind === "text-field" || kind === "text-area") && !sensitive) {
+      const raw = String(el.value);
+      if (looksSecretValue(raw)) {
+        valueWithheld = true;
+        value = "";
+      } else {
+        valueLen = raw.length;
+        value = raw.length > vmax ? raw.slice(0, vmax) : raw;
+      }
+    }
+    let checked = null;
+    if (kind === "checkbox" || kind === "radio") {
+      checked = el.localName === "input" ? el.checked === true : el.getAttribute("aria-checked") === "true";
+    }
+    let selected = null;
+    if (kind === "select-menu" && !sensitive) {
+      selected = Array.from(el.selectedOptions || []).slice(0, 3).map((o) => clip(String(o.label || "").replace(/\s+/g, " ").trim(), 60));
+    }
+    const search = kind === "text-field" && !sensitive && isSearchField(el, cls, name)
+      ? { field: true, ...resolveSubmission(el) }
+      : null;
+    return { kind, inputType: cls.inputType || "", name, nameSource: source, disabled, readOnly, submit: !!cls.submit, sensitive, viewport, rect, region, signature, value, valueLen, valueWithheld, checked, selected, search };
   }
 
   // The same description for one element, computed NOW (null when it is no longer a listed,

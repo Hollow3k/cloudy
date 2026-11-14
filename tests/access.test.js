@@ -115,6 +115,7 @@ const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  
   ok("6: a captured page is on screen", A.getPageContext() !== null && !p.ids["excerpt-details"].hidden);
 
   const before = scriptsBefore();
+  const fetchesBefore = p.state.fetchCalls.length;
   p.state.permCalls.length = 0;
   tab = { id: 8, url: "chrome://extensions/" };
   p.handlers.activated({ tabId: 8 });
@@ -125,7 +126,7 @@ const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  
   tab = { id: 9, url: "https://other.test/" };
   p.handlers.activated({ tabId: 9 });
   await p.tick(30);
-  ok("6: switching to a normal tab shows readable again, without capturing anything", /this page can be read/.test(state().text) && !state().unavailable && A.getPageContext() === null && scriptsBefore() === before);
+  ok("6: switching to a normal tab shows readable again; the only page read is the automatic capture of that active tab (controls only, no model call, no Q&A snapshot)", /this page can be read/.test(state().text) && !state().unavailable && A.getPageContext() === null && p.state.scriptCalls.slice(before).every((c) => c.func === "captureActionTargets") && p.state.fetchCalls.length === fetchesBefore, JSON.stringify(p.state.scriptCalls.slice(before).map((c) => c.func)));
 
   tab = { id: 9, url: "https://other.test/" };
   p.handlers.updated(9, { title: "new title" });

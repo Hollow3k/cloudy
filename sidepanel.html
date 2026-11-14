@@ -29,14 +29,16 @@
         <p class="hint">
           Send is plain chat. "Ask about this page" reads the active tab and answers a
           question. "Suggest next action" reads the tab's controls and proposes ONE step
-          toward the goal you typed. Nothing is clicked, typed or scrolled unless you
-          press Approve on that one proposal.
+          toward the goal you typed. Nothing is clicked, typed, submitted or scrolled unless you
+          press Approve on that one proposal. A search is one operation: one approval fills
+          and submits it.
         </p>
       </form>
 
       <section class="page-context" aria-labelledby="page-context-heading">
         <h2 id="page-context-heading">Page context</h2>
         <p id="access-state">Checking page access...</p>
+        <p id="live-capture">Live capture: none yet.</p>
         <p id="page-info">No page captured.</p>
         <details id="excerpt-details" hidden>
           <summary>Show exactly what was captured</summary>
@@ -78,6 +80,15 @@
         <p id="proposal-note"></p>
         <p id="approval-note"></p>
         <button id="approve-button" type="button" hidden disabled>Approve this one action</button>
+        <div id="confirm-box" class="confirm" hidden>
+          <h3>Confirm a step that may have consequences</h3>
+          <p id="confirm-operation"></p>
+          <p id="confirm-reason"></p>
+          <p id="confirm-known"></p>
+          <p id="confirm-unknown"></p>
+          <button id="confirm-button" type="button" disabled>Yes, run this step once</button>
+          <button id="cancel-confirm-button" type="button">Cancel</button>
+        </div>
       </section>
 
       <section id="execution-section" class="execution" aria-labelledby="execution-heading" hidden>
@@ -106,9 +117,13 @@
         specific sites", click Cloudy's toolbar icon on the tab you want (buttons
         inside this panel do not grant access). Only the
         main page's rendered text is read (not iframes, images, canvas or other
-        pages). Form values and editable text are never read (not even to name a
-        control), but visible text can still contain personal information. It goes only to your local
-        Ollama, is kept in memory, and is not stored.
+        pages). For "Suggest next action" and the automatic live capture, the current text of
+        ordinary text fields, checkbox and radio state and the shown option of selects are read
+        and sent to your local Ollama, so do not use it on a page where an ordinary field holds
+        something private. Password fields and anything identified as a credential, payment
+        detail, CVV or authentication code are never read, and neither are file pickers,
+        editable regions or autofill. Visible text can still contain personal information. It
+        goes only to your local Ollama, is kept in memory, and is not stored.
       </p>
     </main>
     <script src="capture.js"></script>

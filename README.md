@@ -83,8 +83,10 @@ Common messages: `HTTP 403` means the origin is not allowed (check `OLLAMA_ORIGI
 Cloudy declares host access to ordinary websites (`https://*/*` and `http://*/*`; not `file://`, and not
 `<all_urls>`). With that, it can read the active tab of a normal http/https page **without a toolbar click**.
 Chrome shows this as "Read and change all your data on all websites" when you install or reload the extension.
-Cloudy only reads a page when you click **Ask about this page** or **Suggest next action**; nothing is read
-when you switch tabs.
+**Ask about this page** and **Suggest next action** read the page when you click them. While the panel is open,
+Cloudy also captures the *active* page automatically after you switch tabs, when a new active tab has finished
+loading, and after the active page navigates. That is capture only (see "Automatic capture of the active page"): it
+never calls the model and never acts.
 
 Chrome still decides what Cloudy may read:
 
@@ -259,7 +261,9 @@ node tests/make-action-fixtures.js && node tests/dump-targets.js   # fixtures ->
 node tests/targets.test.js      # what the page-side capture returned (privacy, names, bounds, DOM changes)
 node tests/proposal.test.js     # fake model reply -> validation -> live recheck -> what is displayed
 node tests/positions.test.js     # control rectangles/centres, what is serialized to the model (no model call)
-node tests/exec.test.js          # approval + dispatch against a real headless-Chrome DOM (scripted model reply)
+node tests/exec.test.js          # approval + dispatch + Search + confirmation against a real headless-Chrome DOM (scripted model reply)
+node tests/operations.test.js    # automatic capture, dummy secrets, truncation-proof search controls, scroll validity (no browser, no model)
+node tests/search-model.test.js 5   # the local model: "search" for search goals, "type" for type-only goals
 node tests/exec-mutants.js       # breaks one safeguard at a time and checks exec.test.js notices
 node tests/action-model.test.js 5   # the local model's DECISIONS (rate per scenario)
 node tests/position-model.test.js 4 # the local model on positional goals ("bottom left", "the button")
@@ -285,15 +289,38 @@ disabled/read-only state, and whether it is in view or offscreen. It is a suppor
 rules (aria-labelledby, aria-label, `<label>`, visible button/link text, image alt, svg title, title attribute,
 and the placeholder as a **flagged weak fallback**), not a full accessibility tree.
 
-- **Never read:** any input, textarea or select value, password value, autofill content or contenteditable text. No
-  field is ever checked for emptiness. A submit button's `value` is not used as its name either, so
-  `<input type="submit" value="Search">` appears unnamed.
+- **Read (ordinary form state):** the current text of plain text fields and textareas (up to 200 characters; the model
+  sees the first 100), whether a checkbox or radio is checked, and which option a select shows. The model gets this as
+  `value: "..."`, `checked` / `not checked` and `selected: "..."`, refreshed with every proposal. This means text you
+  typed into an ordinary field is sent to your local Ollama.
+- **Never read (secrets):** password fields, and any field identified as a credential, payment detail, CVV or
+  authentication code by its **type, name, id, label, aria-label, placeholder, title or autocomplete**. This is decided
+  from that metadata *before* anything is read, so the value is not read, not sent, not shown and not logged. A value
+  that is read from an ordinary field but has the shape of a card number or token is dropped inside the page (it shows
+  as `value: withheld`). File pickers, other input types, contenteditable text and autofill are never read. Typing a
+  secret into any field stays refused. A submit button's `value` is not used as its name, so
+  `<input type="submit" value="Search">` appears unnamed. The detection is a word list on metadata, not a guarantee:
+  a secret in a field with no telling name or label cannot be recognised.
 - **Left out:** hidden controls (only counted).
 - **Listed but unsupported for proposals:** password and file fields, select menus, other input types,
   contenteditable regions, and fields that look like credential or payment fields.
 - **Not covered, and reported:** iframes, shadow roots and canvas are counted, not entered.
 - **Bounded:** at most 150 controls are captured and about 3200 characters are sent to the model; the rest is
   stated as omitted. The 4000-character Q&A budget is separate and unchanged.
+
+### Automatic capture of the active page
+
+While the panel is open Cloudy captures the active page (the same read-only capture Suggest uses) after: you switch
+tabs, a newly opened active tab finishes loading, and the active page navigates or reloads. It only captures. The panel
+shows one line ("Live capture (automatic, no model call): title, N controls"). The usual access and restricted-page
+checks apply, so `chrome://` pages and the Web Store are not captured. Rules:
+
+- Only the **active** tab is ever read; events from inactive tabs capture nothing.
+- Every tab event ends any pending approval **immediately**, before the new capture runs.
+- Each event supersedes the last: a capture that finishes after another tab or address became active is discarded.
+- It waits (does not interleave) while a model request or an approved action is running, then runs.
+- Closing the panel stops it (nothing runs without the panel). Opening the panel alone captures nothing.
+- No model call and no action ever follows an automatic capture. A proposal still re-captures fresh before the model is asked.
 
 ### Control positions
 
@@ -318,13 +345,15 @@ scroll, resize or tab events, and a scroll does not make a proposal "stale". Not
 
 ### What the panel checks (format, not wisdom)
 
-The reply must have exactly seven fields and an allowed action (`click`, `type`, `scroll`, `ask_user`,
+The reply must have exactly seven fields and an allowed action (`click`, `type`, `search`, `scroll`, `ask_user`,
 `cannot`). Fields the action does not use are ignored and flagged. Then, for click/type: the ID must belong to
 **this** capture and have been **shown to the model**; the control must exist, be enabled and (for typing) not
 read-only; the action must fit the control (no typing into buttons, no clicking text fields); typed text may only
 use words from **your goal** and may not look like a card number or token; credential-looking fields are refused;
-and labels such as buy, pay, delete or send are refused as consequential. A keyword list cannot prove that anything
-else is harmless, so a passing proposal is only called **"valid target/action format"**.
+and a scroll must be possible (room left in that direction) or it is rejected here, not shown as valid with a warning.
+Labels such as buy, pay, delete or send are no longer rejected: they need a separate explicit confirmation (below). A
+keyword list cannot prove that anything else is harmless, so a passing proposal is only called **"valid target/action
+format"**.
 
 ### Freshness
 
@@ -336,17 +365,44 @@ proposal is shown as **stale / freshness not established** and you are asked to 
 navigating, reloading or closing the tab clears a displayed proposal. A DOM change that happens *after* a proposal
 is displayed is not noticed until the next capture, which is why Approve checks the page again right before acting.
 
-### Approving one action
+### Approving one operation
 
-Approve is offered only for a proposal that is valid, fresh, and a click, type or scroll that is actually possible.
-Nothing is offered for `ask_user` or `cannot`, for a blocked or invalid proposal, for a control that is offscreen
-(scroll first; a scroll needs its own approval), or for a scroll that has nowhere to go.
+Approval is per **operation** (what you asked for), not per DOM event. Approve is offered only for a proposal that is
+valid, fresh and possible: a click, a type, a **search** or a scroll. Nothing is offered for `ask_user` or `cannot`,
+for a blocked or invalid proposal, or for a control that is offscreen (scroll first; a scroll needs its own approval).
+
+- **Search is one operation.** "Search for black Nike shoes" proposes ONE operation: fill the validated search field,
+  then submit it. One approval covers that fixed sequence, with no second approval between the steps. "Type black Nike
+  shoes into the search box" proposes only a **type**: it fills the field and never submits (a `search` reply to a goal
+  that only asks to type is blocked, and `type` has no submit code path).
+  - *The search field and the way to submit it are resolved and validated before Approve is offered.* A field counts as
+    a search field when it is `type=search`, in a `role=search`/`<search>` area, or named like one. It is submitted
+    only through (a) an associated, visible, enabled submit/search control of an identified search form (or of a search
+    landmark), which is clicked like a person would, or (b) `form.requestSubmit()` on an identified search form that has
+    no submit control, so native validation and the site's own handling apply. Never `form.submit()`, never a synthetic
+    Enter, never a form that is not identified as a search form. Several equally likely buttons, a disabled or hidden
+    one, or no identified form means *no supported way to submit*, and the search is blocked (a plain type still works).
+  - *These controls are kept in the model's list even when the list is cut for size.*
+  - *If the box already holds exactly the query, it is not retyped*; the same operation just submits.
+  - *Bound to:* the query, the field, the submit control (or form), tab, document and the box's initial content.
+    Everything is checked again before dispatch. After filling, the field must hold exactly the query (the expected NEW
+    state, not the old value) and the submit path must be unchanged; on any surprise it stops, does **not** submit, and
+    says what was already done ("Partly executed: the field was filled ... but the search was NOT submitted"). It does
+    not retry, improvise, click results or buy anything.
+  - *"Search submitted; results observed"* is said only when the new capture shows the page changed and your query is
+    in its address or title. Otherwise it says the submit was requested and results were **not observed**.
+- **Consequential-looking controls** (names such as buy, pay, delete, send, confirm, subscribe, sign out...) are no
+  longer rejected by name. Approve becomes "Review and confirm...", and a separate confirmation shows the operation,
+  why you are asked, what is **known** (for example "a button that submits a form") and that the real effect is
+  **unknown**. Cloudy does not predict a consequence from a name. Nothing runs until you press the second button, and
+  the same stale-state, duplicate-click and Stop rules apply. Disabled, read-only, secret-looking and unsupported
+  controls stay blocked.
 
 - **Blocked vs invalid.** A reply that does not fit the format (made-up or stale ID, click on a text field) is shown as
   *invalid format*. A well-formed reply that Cloudy's rules refuse (disabled, read-only, password/credential or payment
-  field, unsupported control, consequential names such as **Delete**, secret-shaped text, words not in your goal) is
-  shown as *blocked by a rule*. The consequential-name block is unchanged: Delete stays blocked.
-- **One approval, one action.** The approval is bound to the exact action, control, text or direction, tab and
+  field, unsupported control, a search without a safe way to submit, an impossible scroll, secret-shaped text, words
+  not in your goal) is shown as *blocked by a rule*.
+- **One approval, one operation.** The approval is bound to the exact operation, control, text or direction, tab and
   document. It is consumed before anything runs, so repeated clicks cannot run it twice. A new proposal, a tab switch,
   a navigation, closing the tab or a stale page ends it.
 - **Checked again right before acting.** Cloudy reads the page again and requires: same tab, address and document;
@@ -356,15 +412,15 @@ Nothing is offered for `ask_user` or `cannot`, for a blocked or invalid proposal
   the same step as the action, so nothing can change in between.
 - **Click** calls the element's own `click()`. **Type** selects the field's content without reading it and inserts the
   approved text as typing does (an `input` event). It never reads the previous value, never presses Enter and never
-  submits the form. **Scroll** moves only the page's own scroller by at most 80% of the viewport height (800 px max),
+  submits the form (type only fills; it has no submit code path). **Scroll** moves only the page's own scroller by at most 80% of the viewport height (800 px max),
   after checking how much room is left in that direction. Nested scroll containers are not supported.
 - **Script-made events.** These are not real input, so some sites ignore them. The action is reported as *dispatched*,
   not as effective.
 - **After the action.** Cloudy captures the page again and shows the controls now on the page, then stops. It does not
   ask the model for another step. The result keeps three things apart: *action dispatched* (or not, and why),
   *effect observed* (only what the new capture shows: a changed control count, a navigation, the new scroll position),
-  and *goal verified* (always "no": Cloudy does not judge goals). It does not claim a typed value was verified, because
-  values are never read back.
+  and *goal verified* (always "no": Cloudy does not judge goals). A typed value is reported only as what the new capture
+  shows for that (ordinary) field; a field that cannot be read is not claimed.
 - **Stop** cancels an approved action only before it is dispatched. It cannot undo one that has already run; then it
   only skips the follow-up capture.
 

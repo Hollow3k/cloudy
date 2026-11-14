@@ -62,10 +62,15 @@ async function main() {
           window.__CALLS.push(o.func.name);
           if (o.func.name === "captureActionTargets") {
             const t = JSON.parse(JSON.stringify(real.targets));
+            if (window.__forceInView) t.targets.forEach((x) => { if (x.name === "Buy now") x.viewport = "in-view"; });
             if (window.__mutated && window.__CALLS.filter((n) => n === "captureActionTargets").length >= 2) { t.targets[14].name = "Add to wishlist"; t.fingerprint = "deadbeef"; t.targets[14].signature = "0badc0de"; }
             return [{ result: t }];
           }
-          if (o.func.name === "performApprovedAction") return [{ result: { ok: true, action: o.args[0].action, kind: o.args[0].kind, method: "insertText" } }];
+          if (o.func.name === "performApprovedAction") {
+            const sp = o.args[0];
+            if (sp.action === "search") return [{ result: { ok: true, action: "search", steps: [{ step: "fill", done: true, method: "insertText" }, { step: "submit", done: true, via: sp.submit.via }] } }];
+            return [{ result: { ok: true, action: sp.action, kind: sp.kind, method: "insertText" } }];
+          }
           return [{ result: real.snapshot }];
         } },
       };
@@ -115,6 +120,31 @@ async function main() {
     const approved = await evalIn(`({ calls: window.__CALLS.join(","), status: document.getElementById("status").textContent, goal: document.getElementById("execution-goal").textContent, overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth })`);
     await shot("ui_approved_type");
     console.log("approved_type: approve shown=" + approveShown + " | " + approved.status.slice(0, 100) + " | " + approved.goal.slice(0, 60) + " | overflowX=" + approved.overflowX);
+
+    // A search offered for approval, and a consequential control waiting for its separate confirmation.
+    const fresh = async () => {
+      await send("Page.navigate", { url: "file:///" + path.join(root, "sidepanel.html").replace(/\\/g, "/") });
+      for (let i = 0; i < 80; i++) { await sleep(150); if ((await evalIn("typeof suggestNextAction")) === "function") break; }
+    };
+    await fresh();
+    await evalIn(`window.__reply = () => ({ rationale: "The search box is where a product search goes.", action: "search", target_id: byName(actionContext, "Search products"), text: "red running shoes", direction: "", question: "", reason: "" }); document.getElementById("prompt-input").value = "search for red running shoes"; document.getElementById("suggest-button").click(); 0`);
+    await sleep(900);
+    const searchShown = await evalIn(`({ hidden: document.getElementById("approve-button").hidden, label: document.getElementById("approve-button").textContent, note: document.getElementById("approval-note").textContent.slice(0, 120), overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth })`);
+    await shot("ui_search_offered");
+    console.log("search_offered: " + JSON.stringify(searchShown));
+    await evalIn(`document.getElementById("approve-button").click(); 0`);
+    await sleep(1500);
+    await shot("ui_search_done");
+    console.log("search_done: " + (await evalIn(`document.getElementById("execution-status").textContent`)).slice(0, 120));
+    await fresh();
+    await evalIn(`window.__forceInView = true; window.__reply = () => ({ rationale: "The Buy now button matches the goal.", action: "click", target_id: byName(actionContext, "Buy now"), text: "", direction: "", question: "", reason: "" }); document.getElementById("prompt-input").value = "buy these shoes"; document.getElementById("suggest-button").click(); 0`);
+    await sleep(900);
+    const buyShown = await evalIn(`document.getElementById("approve-button").textContent`);
+    await evalIn(`document.getElementById("approve-button").click(); 0`);
+    await sleep(300);
+    const confirmState = await evalIn(`({ boxHidden: document.getElementById("confirm-box").hidden, calls: window.__CALLS.filter((n) => n === "performApprovedAction").length, known: document.getElementById("confirm-known").textContent, overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth })`);
+    await shot("ui_confirm_open");
+    console.log("confirm_open: label=" + buyShown + " | " + JSON.stringify(confirmState));
 
     // Open the inspection panels once.
     await evalIn(`window.__reply = () => (${SCENARIOS.valid_type.reply})(actionContext); 0`);

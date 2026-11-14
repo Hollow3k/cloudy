@@ -9,7 +9,7 @@ const root = path.join(__dirname, "..");
 const results = [];
 const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  -> " + String(extra).slice(0, 230) : ""}`);
 
-const actionsSrc = fs.readFileSync(path.join(root, "actions.js"), "utf8");
+const actionsSrc = fs.readFileSync(process.env.ACTIONS_SRC || path.join(root, "actions.js"), "utf8");
 const A = new Function(actionsSrc.replace(/^const /gm, "var ") + "\nreturn { normalizeTargetCapture, buildActionRecords, packTargets, buildActionPrompt, targetSupport, TARGET_LIMITS, ACTION_TARGET_BUDGET_CHARS, ACTION_CONTEXT_BUDGET_CHARS };")();
 const load = (n) => JSON.parse(fs.readFileSync(path.join(out, n + ".json"), "utf8"));
 const store = load("act_store");
@@ -20,21 +20,53 @@ const byName = (norm, name, kind) => norm.targets.filter((t) => t.name === name 
   const norm = A.normalizeTargetCapture(store.targets);
   ok("store: capture normalizes", norm && norm.targets.length === 37, norm && String(norm.targets.length));
 
-  // ===== Privacy: nothing the user typed, or the page hid, is in the capture =====
-  const markers = ["PERSONAL_SEARCH_VALUE", "CSRF_HIDDEN_SECRET", "PERSONAL_VALUE_NAME_123", "HUNTER2_SECRET", "TEXTAREA_SECRET_TEXT", "EDITABLE_SECRET_TEXT", "READONLY_VALUE_555", "OPTION_SECRET_A", "OPTION_SECRET_B", "4111111111111111", "COUPON_VALUE_42", "NICK_VALUE", "PAY_VALUE_SUBMIT", "HIDDEN_BUTTON_DISPLAY", "HIDDEN_BUTTON_ATTR", "HIDDEN_BUTTON_VIS", "IFRAME_BUTTON", "SHADOW_BUTTON", "ARTICLE_TEXT_ONE"];
-  ok("privacy: none of 19 planted markers (values, hidden, iframe, shadow, article text) are in the capture", markers.every((m) => !raw.includes(m)), markers.filter((m) => raw.includes(m)).join(","));
+  // ===== Privacy: ordinary form state is read; secrets and everything else never are =====
+  // Ordinary state of plain text fields/areas, and the shown option of a select, IS captured now.
+  const ordinary = ["PERSONAL_SEARCH_VALUE", "PERSONAL_VALUE_NAME_123", "TEXTAREA_SECRET_TEXT", "READONLY_VALUE_555", "OPTION_SECRET_A", "COUPON_VALUE_42", "NICK_VALUE"];
+  // Secrets, hidden fields, editable regions, an unselected option, a submit button's value, other frames and article text are not.
+  const forbidden = ["CSRF_HIDDEN_SECRET", "HUNTER2_SECRET", "EDITABLE_SECRET_TEXT", "OPTION_SECRET_B", "4111111111111111", "PAY_VALUE_SUBMIT", "HIDDEN_BUTTON_DISPLAY", "HIDDEN_BUTTON_ATTR", "HIDDEN_BUTTON_VIS", "IFRAME_BUTTON", "SHADOW_BUTTON", "ARTICLE_TEXT_ONE"];
+  ok("privacy: none of 12 forbidden markers (password, card number, hidden, editable text, unselected option, button value, iframe, shadow, article text) is in the capture", forbidden.every((m) => !raw.includes(m)), forbidden.filter((m) => raw.includes(m)).join(","));
+  ok("privacy: the 7 ORDINARY markers (plain text field/area values, a read-only field, the selected option) are captured", ordinary.every((m) => raw.includes(m)), ordinary.filter((m) => !raw.includes(m)).join(","));
   const names = norm.targets.map((t) => t.name).join("|");
-  ok("privacy: ...nor in the names, even for fields that hold values", !markers.some((m) => names.includes(m)));
-  ok("privacy: no field returns a value/text/emptiness property at all", norm.targets.every((t) => !("value" in t) && !("text" in t) && !("empty" in t) && !("checked" in t)) && !/"value"|"empty"|"checked"|"href"/.test(raw));
+  ok("privacy: values never leak into control NAMES", !ordinary.concat(forbidden).some((m) => names.includes(m)));
+  const stText = norm.targets.filter((t) => t.kind === "text-field" || t.kind === "text-area");
+  ok("privacy: only plain text fields/areas carry a value; password, credential, file, editable and other controls carry none", norm.targets.every((t) => (t.value === null) === !(t.kind === "text-field" || t.kind === "text-area") || t.sensitive || t.valueWithheld) && norm.targets.filter((t) => t.sensitive || t.kind === "password-field" || t.kind === "file-picker" || t.kind === "editable-region").every((t) => t.value === null && t.selected === null), JSON.stringify(norm.targets.filter((t) => t.sensitive).map((t) => t.name)));
+  ok("privacy: the card-number field and the password are flagged unsupported and carry no value", norm.targets.filter((t) => /Card number/.test(t.name) || t.kind === "password-field").every((t) => t.value === null && A.buildActionRecords(norm, "a1").get("a1:E" + t.n).support.unsupported !== ""));
   ok("privacy: link destinations are not returned", !/https?:\/\/|shop\.test/.test(raw.replace(/"url":"[^"]*"/, "")));
+  const selSize = norm.targets.find((t) => t.kind === "select-menu" && t.name === "Size");
+  ok("state: a select shows only its selected option; a text field shows its value; a checkbox its state", selSize && JSON.stringify(selSize.selected) === '["OPTION_SECRET_A"]' && stText.some((t) => t.value === "PERSONAL_VALUE_NAME_123") && norm.targets.some((t) => t.kind === "checkbox" && t.checked === false));
 
   // Identical markup, empty vs populated (including a script-set value like autofill).
   const e = A.normalizeTargetCapture(load("act_values_empty").targets);
   const f = A.normalizeTargetCapture(load("act_values_filled").targets);
-  ok("differential: empty and populated pages give IDENTICAL captures (values and emptiness are never inspected)", JSON.stringify(e.targets) === JSON.stringify(f.targets) && e.fingerprint === f.fingerprint, e.fingerprint + " vs " + f.fingerprint);
   const fraw = JSON.stringify(load("act_values_filled").targets);
-  ok("differential: populated page leaks none of its 6 markers", ["A_VALUE_MARK", "P_VALUE_MARK", "NOTES_TEXT_MARK", "EDITOR_TEXT_MARK", "AUTOFILL_VALUE_MARK", "SEARCH_VALUE_MARK"].every((m) => !fraw.includes(m)));
-  ok("differential: fields are still listed (7 controls), only by safe metadata", f.targets.length === 7 && f.targets.some((t) => t.kind === "password-field") && f.targets.some((t) => t.kind === "editable-region"), f.targets.map((t) => t.kind).join(","));
+  ok("differential: values do not change identity: signatures, kinds and the page fingerprint are identical empty vs populated", JSON.stringify(e.targets.map((t) => [t.kind, t.name, t.signature])) === JSON.stringify(f.targets.map((t) => [t.kind, t.name, t.signature])) && e.fingerprint === f.fingerprint, e.fingerprint + " vs " + f.fingerprint);
+  ok("differential: populated page: ordinary markers captured (email, notes, autofilled and search fields)", ["A_VALUE_MARK", "NOTES_TEXT_MARK", "AUTOFILL_VALUE_MARK", "SEARCH_VALUE_MARK"].every((m) => fraw.includes(m)));
+  ok("differential: ...but the password value and the editable region's text are NOT", !fraw.includes("P_VALUE_MARK") && !fraw.includes("EDITOR_TEXT_MARK"));
+  ok("differential: the empty page reports empty values (not 'unknown')", e.targets.filter((t) => t.kind === "text-field" || t.kind === "text-area").every((t) => t.value === ""));
+  ok("differential: fields are still listed (7 controls)", f.targets.length === 7 && f.targets.some((t) => t.kind === "password-field") && f.targets.some((t) => t.kind === "editable-region"), f.targets.map((t) => t.kind).join(","));
+
+  // ===== DUMMY secrets: excluded by type, name, id, label, aria-label, placeholder, title and autocomplete =====
+  const sec = load("act_secrets");
+  const secRaw = JSON.stringify(sec.targets);
+  const secNorm = A.normalizeTargetCapture(sec.targets);
+  const dummies = (["DUMMY_PW_1", "DUMMY_CARDNO_2", "DUMMY_CCNUM_3", "DUMMY_CVV_4", "DUMMY_SECCODE_5", "DUMMY_OTP_6", "DUMMY_APIKEY_7", "DUMMY_VERIF_8", "DUMMY_PIN_9", "DUMMY_AUTH_10", "DUMMY_EXPIRY_11", "DUMMY_MONTH_12", "EDITABLE_MARK_13"]);
+  ok("secrets: none of 13 dummy secrets is in the raw capture the page returned", dummies.every((m) => !secRaw.includes(m)), dummies.filter((m) => secRaw.includes(m)).join(","));
+  const secRecords = A.buildActionRecords(secNorm, "a1");
+  const secPacked = A.packTargets(secRecords, A.ACTION_TARGET_BUDGET_CHARS);
+  const secPrompt = A.buildActionPrompt("fill the form", secNorm, null, secPacked);
+  ok("secrets: none is in the model prompt, the 'controls sent' text or the normalized records", dummies.every((m) => !secPrompt.includes(m) && !JSON.stringify([...secRecords.values()]).includes(m) && !secPacked.lines.join("\n").includes(m)));
+  const flagged = secNorm.targets.filter((t) => t.value === null && t.kind !== "editable-region" && t.kind !== "checkbox" && t.kind !== "radio");
+  ok("secrets: all 12 credential-looking fields carry no value and are marked unsupported (password, 3 by label, aria-label, placeholder, name, title, autocomplete x2, expiry, month select)", flagged.length >= 12 && flagged.every((t) => secRecords.get("a1:E" + t.n).support.unsupported !== ""), flagged.map((t) => t.name || t.kind).join(" | "));
+  const byN = (name) => secNorm.targets.find((t) => t.name === name);
+  ok("secrets: ordinary fields next to them ARE read, including look-alike words ('Passenger name', 'Username', notes)", byN("Username").value === "ORD_USER_MARK" && byN("Passenger name").value === "ORD_PASSENGER_MARK" && byN("Notes").value === "ORD_NOTES_MARK");
+  ok("secrets: a card-shaped value in an ORDINARY field is withheld inside the page and again in the panel", byN("Reference").valueWithheld === true && byN("Reference").value === "" && !secRaw.includes("4111 1111") && /value: withheld/.test(secPacked.lines.join("\n")));
+  ok("secrets: checkbox and radio state are captured as plain true/false; the ordinary select shows its option", byN("Subscribe me").checked === true && byN("Remember my choice").checked === false && byN("Express").checked === true && byN("Standard").checked === false && JSON.stringify(byN("Size").selected) === '["LARGE_MARK"]');
+  const forged = JSON.parse(JSON.stringify(sec.targets));
+  forged.targets.find((t) => t.name === "CVV").value = "DUMMY_FORGED_CVV";
+  forged.targets.find((t) => t.name === "Password").value = "DUMMY_FORGED_PW";
+  const forgedNorm = A.normalizeTargetCapture(forged);
+  ok("secrets: even if a page-side bug returned a value for a flagged field, the panel drops it", !JSON.stringify(forgedNorm).includes("DUMMY_FORGED"));
 
   // ===== Accessible-name subset =====
   const t = (n) => norm.targets.find((x) => x.n === n);
@@ -131,7 +163,11 @@ const byName = (norm, name, kind) => norm.targets.filter((t) => t.name === name 
   // ===== Source hygiene =====
   const strip = (f) => fs.readFileSync(path.join(root, f), "utf8").split("\n").filter((l) => !/^\s*(\/\/|\*)/.test(l)).join("\n");
   const tcode = strip("targets.js");
-  ok("source: targets.js never reads a value, text content of fields, or inner/outer HTML", !/\.value\b|\.defaultValue\b|getAttribute\(\s*["']value["']\s*\)|innerHTML|outerHTML|\.innerText|\.checked\b|\.selectedIndex|\.options\b/.test(tcode));
+  const valueReads = tcode.match(/\.value\b/g) || [];
+  const idxValue = tcode.indexOf("String(el.value)");
+  ok("source: targets.js reads .value in exactly ONE place, inside the block guarded by !sensitive and a text-field/text-area kind; never innerHTML/innerText/defaultValue", valueReads.length === 1 && idxValue > 0 && /\(kind === "text-field" \|\| kind === "text-area"\) && !sensitive/.test(tcode.slice(idxValue - 120, idxValue)) && !/innerHTML|outerHTML|\.innerText|\.defaultValue|getAttribute\(\s*["']value["']\s*\)/.test(tcode));
+  ok("source: sensitivity is decided from metadata BEFORE the value is read", tcode.indexOf("const sensitive") > 0 && tcode.indexOf("const sensitive") < idxValue);
+  ok("source: select state is read only under !sensitive; checked only for checkbox/radio", /kind === "select-menu" && !sensitive/.test(tcode) && /kind === "checkbox" \|\| kind === "radio"/.test(tcode));
   ok("source: targets.js has no page-changing calls", !/\.click\(|\.focus\(|\.dispatchEvent|\.submit\(|scrollTo|scrollBy|scrollIntoView|\.setAttribute|\.appendChild|\.remove\(|\.removeChild|\.insertBefore|\.innerHTML\s*=|window\.open|location\s*=|location\.(assign|replace|href\s*=)|\.style\.[a-zA-Z]+\s*=|document\.write|\.requestSubmit|\.select\(\)|\.stepUp|\.stepDown|\.reset\(\)/.test(tcode));
   ok("source: no site-specific names or selectors in targets.js / actions.js", !/myntra|google|amazon|pinterest|mdn|wikipedia|#[a-z]+-[a-z]+/i.test(tcode + strip("actions.js")));
   ok("source: actions.js has no DOM, chrome.* or fetch use", !/\bdocument\b|\bchrome\.|\bfetch\(|\bwindow\b|\beval\(|new Function/.test(strip("actions.js")));

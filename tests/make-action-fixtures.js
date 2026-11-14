@@ -97,6 +97,34 @@ files.act_addremove_rows = page("Add/Remove Elements (wrapped)",
 <button type="button">Add Element</button>
 <div id="elements" style="width:300px">${'<button type="button" class="added-manually" style="width:90px">Delete</button>'.repeat(5)}</div></main>`);
 
+// DUMMY secrets only (every value is a made-up marker). Secrets are identified by type, name, id,
+// label, aria-label, placeholder, title or autocomplete and must never be read. Ordinary fields
+// next to them (including look-alike words such as "Passenger") must still be read.
+files.act_secrets = page("Checkout",
+  `<main><h1>Account</h1><form onsubmit="return false">
+<label for="u">Username</label><input id="u" type="text" value="ORD_USER_MARK">
+<label>Password <input type="password" value="DUMMY_PW_1"></label>
+<label>Card number <input name="x1" value="DUMMY_CARDNO_2"></label>
+<label for="c2">Number on the front</label><input id="c2" autocomplete="cc-number" value="DUMMY_CCNUM_3">
+<label>CVV <input value="DUMMY_CVV_4"></label>
+<input aria-label="Security code" value="DUMMY_SECCODE_5">
+<input placeholder="One-time code" value="DUMMY_OTP_6">
+<input name="api_key" value="DUMMY_APIKEY_7">
+<label>Verification code <input value="DUMMY_VERIF_8"></label>
+<input type="text" title="PIN" value="DUMMY_PIN_9">
+<input type="text" autocomplete="one-time-code" value="DUMMY_AUTH_10">
+<label for="e1">Expiry</label><input id="e1" value="DUMMY_EXPIRY_11">
+<label>Notes <textarea>ORD_NOTES_MARK</textarea></label>
+<label>Passenger name <input value="ORD_PASSENGER_MARK"></label>
+<label>Reference <input value="4111 1111 1111 1111"></label>
+<label><input type="checkbox" checked> Subscribe me</label>
+<label><input type="checkbox"> Remember my choice</label>
+<input type="radio" name="r" id="ra" checked><label for="ra">Express</label><input type="radio" name="r" id="rb"><label for="rb">Standard</label>
+<label>Size <select><option>SMALL_MARK</option><option selected>LARGE_MARK</option></select></label>
+<label>Month <select autocomplete="cc-exp-month"><option selected>DUMMY_MONTH_12</option></select></label>
+<div contenteditable="true" aria-label="Message editor">EDITABLE_MARK_13</div>
+</form></main>`);
+
 // Hundreds of controls: the capture and the list sent to the model must stay bounded.
 files.act_many = page("Many controls",
   `<main><h1>Catalogue</h1>${Array.from({ length: 300 }, (_, i) => `<button type="button">Item ${i + 1}</button>`).join(" ")}<a href="/last">Last link</a></main>`);

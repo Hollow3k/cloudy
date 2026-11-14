@@ -31,9 +31,9 @@ const read = (f) => fs.readFileSync(path.join(root, f), "utf8");
   // The rectangle is geometry only: nothing else about values changed.
   const e = A.normalizeTargetCapture(fx("act_values_empty").targets);
   const f = A.normalizeTargetCapture(fx("act_values_filled").targets);
-  ok("1: privacy differential still holds with rectangles: empty and populated pages give identical captures", JSON.stringify(e.targets) === JSON.stringify(f.targets) && e.targets.every((t) => t.rect));
+  ok("1: values do not change identity, and every control still has a rectangle: empty and populated pages give identical kinds, signatures and boxes", JSON.stringify(e.targets.map((t) => [t.kind, t.name, t.signature, t.rect])) === JSON.stringify(f.targets.map((t) => [t.kind, t.name, t.signature, t.rect])) && e.targets.every((t) => t.rect));
   const src = read("targets.js").replace(/^\s*\/\/.*$/gm, "");
-  ok("1: targets.js reads geometry with getBoundingClientRect and still never reads .value/.innerText/.textContent of form controls", /getBoundingClientRect/.test(src) && !/\.value\b|\.innerText|\.defaultValue|\.selectedOptions|\.checked\b/.test(src));
+  ok("1: targets.js reads geometry with getBoundingClientRect; its only value read is the guarded one (see targets.test.js) and it never uses innerText/defaultValue", /getBoundingClientRect/.test(src) && (src.match(/\.value\b/g) || []).length === 1 && !/\.innerText|\.defaultValue/.test(src));
   const sig = (name) => fx(name);
   const so = sig("dyn_scroll_only");
   ok("1: scrolling moves the rectangles but not the signature/fingerprint (a scroll is not 'the page changed')", so.before.fingerprint === so.after.fingerprint && so.before.targets.some((t, i) => t.rect.y !== so.after.targets[i].rect.y) && so.before.targets.every((t, i) => t.signature === so.after.targets[i].signature));
@@ -81,7 +81,7 @@ const read = (f) => fs.readFileSync(path.join(root, f), "utf8");
   const storeLines = targetsBlock(sentBody()).split("\n");
   const terms = storeLines.find((l) => /name: "Terms"/.test(l));
   const mt = terms && terms.match(/OFFSCREEN \(below the viewport\) \[(-?\d+),(-?\d+)\]/);
-  ok("3: with positions added, the fixture's planted values/markers (typed values, hidden fields, password, textarea, editable text) still never reach the request", ["PERSONAL_SEARCH_VALUE", "CSRF_HIDDEN_SECRET", "PERSONAL_VALUE_NAME_123", "HUNTER2_SECRET", "TEXTAREA_SECRET_TEXT", "EDITABLE_SECRET_TEXT", "READONLY_VALUE_555", "OPTION_SECRET_A", "4111111111111111", "COUPON_VALUE_42", "NICK_VALUE", "IFRAME_BUTTON", "SHADOW_BUTTON"].every((m) => !JSON.stringify(sentBody()).includes(m)));
+  ok("3: with positions added, the fixture's secrets, hidden fields, editable text and unselected options still never reach the request", ["CSRF_HIDDEN_SECRET", "HUNTER2_SECRET", "EDITABLE_SECRET_TEXT", "OPTION_SECRET_B", "4111111111111111", "IFRAME_BUTTON", "SHADOW_BUTTON"].every((m) => !JSON.stringify(sentBody()).includes(m)));
   ok("3: an offscreen control shows OFFSCREEN plus its real centre (y beyond the viewport height)", !!mt && Number(mt[2]) > 800, terms);
 
   // A control with no box: no coordinates, position stays unknown.
@@ -95,7 +95,7 @@ const read = (f) => fs.readFileSync(path.join(root, f), "utf8");
   ok("4: relative-layout rule: left/right/top/bottom decided from the [x,y] centres, lowest row then smallest x", /Position words in the goal/.test(sys) && /smaller x is further left, larger y is lower/.test(sys) && /"bottom left" is the lowest row, then the smallest x in that row/.test(sys));
   ok("4: the answer is a control ID, never coordinates", /Answer with the chosen control's ID, never with coordinates/.test(sys));
   ok("4: ask only when genuinely ambiguous; never scroll to resolve a positional request", /does not single out one control/.test(sys) && /never because a positional request could not be resolved/.test(sys));
-  ok("4: the existing action schema is unchanged (same keys, same order, same actions)", JSON.stringify(A.ACTION_SCHEMA.required) === '["rationale","action","target_id","text","direction","question","reason"]' && JSON.stringify(A.ACTION_NAMES) === '["click","type","scroll","ask_user","cannot"]' && JSON.stringify(Object.keys(A.ACTION_SCHEMA.properties)) === JSON.stringify(A.ACTION_SCHEMA.required) && sentBody().format.additionalProperties === false);
+  ok("4: the existing action schema is unchanged (same keys, same order, same actions)", JSON.stringify(A.ACTION_SCHEMA.required) === '["rationale","action","target_id","text","direction","question","reason"]' && JSON.stringify(A.ACTION_NAMES) === '["click","type","search","scroll","ask_user","cannot"]' && JSON.stringify(Object.keys(A.ACTION_SCHEMA.properties)) === JSON.stringify(A.ACTION_SCHEMA.required) && sentBody().format.additionalProperties === false);
   ok("4: the list is still within its character budget", targetsBlock(sentBody()).length < 3200 + 400);
 
   // ===== 5. Positions are refreshed by each fresh capture, and only then =====
@@ -111,9 +111,9 @@ const read = (f) => fs.readFileSync(path.join(root, f), "utf8");
   const code = read("sidepanel.js") + read("targets.js") + read("actions.js");
   ok("5: no scroll/resize/mutation listeners and no timers that re-capture", !/addEventListener\(\s*["'](scroll|resize|wheel)|onscroll|MutationObserver|IntersectionObserver|ResizeObserver|setInterval/.test(code));
   p.state.scriptCalls.length = 0; p.state.fetchCalls.length = 0;
-  p.handlers.updated(7, { title: "x" }); p.handlers.activated({ tabId: 7 });
+  p.handlers.updated(7, { title: "x" });
   await p.tick(40);
-  ok("5: tab events and idling trigger no capture and no model call", p.state.scriptCalls.length === 0 && p.state.fetchCalls.length === 0);
+  ok("5: a title update triggers nothing; idling triggers no capture and no model call", p.state.scriptCalls.length === 0 && p.state.fetchCalls.length === 0);
 
   // ===== 6. Proposals only; the validator is unchanged =====
   p.useAction("act_addremove");
@@ -121,7 +121,7 @@ const read = (f) => fs.readFileSync(path.join(root, f), "utf8");
   p.state.fetchImpl = async () => ({ ok: true, json: async () => ({ response: JSON.stringify({ rationale: "E2 [35,111] is leftmost in the lowest row.", action: "click", target_id: `${A.getActionContext().version}:E2`, text: "", direction: "", question: "", reason: "" }), prompt_eval_count: 1, total_duration: 1 }) });
   await p.suggest("click the bottom left button");
   const v = p.actionView();
-  ok("6: the model's choice of the first Delete is shown by its ID and checked as before; 'Delete' is still refused as consequential-looking (policy unchanged)", v.rejected && v.checks.some((c) => /suggests a consequential action/.test(c)) && /E2/.test(v.action + v.checks.join(" ")) && /Nothing has been clicked/.test(v.note) && p.ids["approve-button"].hidden === true, v.banner + " | " + v.checks.join(" // "));
+  ok("6: the model's choice of the first Delete is shown by its ID; 'Delete' is not rejected any more but needs a separate explicit confirmation (nothing runs from the first button)", !v.rejected && /Valid target\/action format/.test(v.banner) && /E2/.test(v.action) && v.warnings.some((w) => /needs an explicit confirmation/.test(w)) && /Nothing has been clicked/.test(v.note), v.banner + " | " + v.warnings.join(" // "));
   ok("6: the panel, actions and targets code contain no click/type/scroll/navigate calls (only executor.js acts, after approval)", !/\.click\(|dispatchEvent|scrollTo\(|scrollBy\(|chrome\.tabs\.(update|create)|chrome\.debugger|elementFromPoint|Input\.dispatch/.test(code));
   ok("6: coordinates are never used to look up or act on anything (no elementFromPoint, no coordinate parsing of the reply)", !/elementFromPoint|centre\[0\]\s*[<>]|parseCoord/.test(read("sidepanel.js") + read("actions.js").replace(/^.*centre.*$/gm, "")));
 

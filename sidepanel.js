@@ -89,6 +89,14 @@ const proposalCoverage = document.getElementById("proposal-coverage");
 const proposalNote = document.getElementById("proposal-note");
 const approveButton = document.getElementById("approve-button");
 const approvalNote = document.getElementById("approval-note");
+const confirmBox = document.getElementById("confirm-box");
+const confirmOperation = document.getElementById("confirm-operation");
+const confirmReason = document.getElementById("confirm-reason");
+const confirmKnown = document.getElementById("confirm-known");
+const confirmUnknown = document.getElementById("confirm-unknown");
+const confirmButton = document.getElementById("confirm-button");
+const cancelConfirmButton = document.getElementById("cancel-confirm-button");
+const liveCaptureEl = document.getElementById("live-capture");
 const executionSection = document.getElementById("execution-section");
 const executionAction = document.getElementById("execution-action");
 const executionStatus = document.getElementById("execution-status");
@@ -146,6 +154,17 @@ let pendingApproval = null;
 // { approval, cancelled, cancelReason, dispatching }
 let activeExecution = null;
 
+// Automatic capture of the ACTIVE page while the panel is open. It only captures (the same
+// read-only page read as Suggest); it never calls the model and never acts. Every event bumps
+// autoSeq, so a capture that finishes late (another tab or document became active meanwhile)
+// is discarded.
+const AUTO_DEBOUNCE_MS = 350;
+let autoEnabled = true; // false once the panel is closing
+let autoTimer = null;
+let autoSeq = 0;
+let autoPending = false; // an event arrived while a request or approved action was running
+let liveCapture = null; // { tabId, urlStripped, documentToken, title, count, capturedAt }
+
 function setStatus(message, isError = false) {
   statusEl.textContent = message; // textContent: never parsed as HTML
   statusEl.classList.toggle("error", isError);
@@ -157,6 +176,11 @@ function setBusy(busy) {
   askPageButton.disabled = busy;
   suggestButton.disabled = busy;
   approveButton.disabled = busy || pendingApproval === null; // never enabled without an approval
+  confirmButton.disabled = busy || pendingApproval === null;
+  if (!busy && autoPending) {
+    autoPending = false;
+    scheduleAutoCapture();
+  }
   stopButton.disabled = !busy;
   input.readOnly = busy; // still focusable, but can't be edited mid-request
 }
@@ -195,7 +219,9 @@ function dropApproval() {
   pendingApproval = null;
   approveButton.hidden = true;
   approveButton.disabled = true;
+  approveButton.textContent = APPROVE_LABEL;
   approvalNote.textContent = "";
+  hideConfirmation();
 }
 
 function clearExecution() {
@@ -1531,7 +1557,7 @@ async function recheckActionTargets(ctx, record) {
 
 async function evaluateActionReply(text, goal, ctx) {
   const scroll = ctx.norm.scroll;
-  const result = validateActionReply(text, goal, { version: ctx.version, records: ctx.records, scroll });
+  const result = validateActionReply(text, goal, { version: ctx.version, records: ctx.records, scroll, viewport: ctx.norm.viewport });
   const freshness = result.kind === "valid" ? await recheckActionTargets(ctx, result.record) : null;
   return { result, freshness };
 }
@@ -1639,29 +1665,43 @@ function renderProposal(outcome, ctx, rawText) {
   return `The proposal has a valid format, but ${why}. Capture again. Nothing was executed.`;
 }
 
-// ---- Approved execution of ONE action ------------------------------------------------------
+// ---- Approved execution of ONE operation ---------------------------------------------------
 // Nothing here runs by itself. The model's proposal is displayed; only the Approve button
-// starts anything, for that one proposal, once. After the action the panel captures the page
-// again and stops: it never asks the model for another step.
+// starts anything, for that one proposal, once. An "operation" is what the person asked for
+// (click, type, scroll, or a search = fill + submit), not a single DOM event: a search is one
+// fixed sequence under one approval. After the operation the panel captures the page again and
+// stops: it never asks the model for another step.
 
 const SETTLE_MS = 450; // after dispatch, give a navigation a moment to start
 const SETTLE_MAX_POLLS = 12; // then wait (bounded) for the tab to finish loading
+const APPROVE_LABEL = "Approve this one action";
 
-// Bind the approval to exactly what is on screen: action, target, text or direction, tab,
-// document and the page's control list. It is not reused for anything else.
+// Bind the approval to exactly what is on screen: operation, target, text or direction, the
+// search path and the state it started from, tab, document and the page's control list.
+// It is not reused for anything else.
 function offerApproval(result, ctx) {
   const p = result.proposal;
   const rec = result.record || null;
-  pendingApproval = {
+  const confirm = result.confirm || null;
+  const isSearch = p.action === "search";
+  const plan = isSearch && rec ? searchPlan(rec, p.text) : null;
+  const approval = {
     id: ++approvalCounter,
     consumed: false,
+    confirmed: false,
     action: p.action,
-    text: p.action === "type" ? p.text : "",
+    text: p.action === "type" || isSearch ? p.text : "",
     direction: p.action === "scroll" ? p.direction : "",
     targetId: rec ? rec.id : "",
     key: rec ? rec.key : 0,
     signature: rec ? rec.signature : "",
     kind: rec ? rec.kind : "",
+    // the relevant initial state of a search (the field's content and how it is submitted)
+    initialValue: isSearch ? rec.value : null,
+    initialValueLen: isSearch ? rec.valueLen : 0,
+    search: isSearch ? rec.search : null,
+    plan,
+    confirm,
     tabId: ctx.tabId,
     urlStripped: ctx.urlStripped,
     documentToken: ctx.norm.documentToken,
@@ -1672,15 +1712,52 @@ function offerApproval(result, ctx) {
     description: describeProposal(p, rec),
     submit: !!(rec && rec.submit),
   };
-  approvalNote.textContent =
-    `Approve runs only this one step: ${pendingApproval.description} ` +
+  pendingApproval = approval;
+  const common =
     "Cloudy checks the page and the control again first and refuses if anything differs. " +
-    (p.action === "scroll" ? "It scrolls the page itself by a bounded amount. " : "") +
-    (p.action === "type" ? "It enters the text without reading what the field holds, and does not submit the form. " : "") +
-    (pendingApproval.submit ? "This button submits a form. " : "") +
-    "It will not ask the model for another step, and Stop cannot undo it once it has run.";
+    "It will not ask the model for another step, and Stop cannot undo a step once it has run.";
+  if (isSearch) {
+    approvalNote.textContent =
+      `Approve runs this operation once, as a fixed sequence with no second approval between the steps: 1) ${plan.steps[0]}; 2) ${plan.steps[1]}. ` +
+      "It checks the field after filling it and stops, saying what was already done, if anything differs. " +
+      "It does not open results or click anything else. " + common;
+    approveButton.textContent = "Approve this search (fill and submit)";
+  } else {
+    approvalNote.textContent =
+      `Approve runs only this one step: ${approval.description} ` +
+      "Cloudy checks the page and the control again first and refuses if anything differs. " +
+      (p.action === "scroll" ? "It scrolls the page itself by a bounded amount. " : "") +
+      (p.action === "type" ? "It enters the text without reading what the field holds, and does not submit the form (typing only). " : "") +
+      (approval.submit ? "This button submits a form. " : "") +
+      "It will not ask the model for another step, and Stop cannot undo it once it has run.";
+    approveButton.textContent = APPROVE_LABEL;
+  }
+  if (confirm) {
+    approvalNote.textContent += " This step needs a separate explicit confirmation after you press the button.";
+    approveButton.textContent = "Review and confirm...";
+  }
   approveButton.hidden = false;
   approveButton.disabled = inFlight;
+}
+
+// The extra, distinct step for a consequential-looking control: what will run, what is known,
+// and what is not known. Nothing runs from this view until the second button is pressed.
+function showConfirmation(approval) {
+  confirmOperation.textContent = `Operation: ${approval.description}`;
+  confirmReason.textContent = approval.confirm.reason;
+  confirmKnown.textContent = approval.confirm.known;
+  confirmUnknown.textContent = approval.confirm.unknown;
+  confirmBox.hidden = false;
+  approveButton.hidden = true;
+  confirmButton.disabled = inFlight;
+}
+
+function hideConfirmation() {
+  confirmBox.hidden = true;
+  confirmOperation.textContent = "";
+  confirmReason.textContent = "";
+  confirmKnown.textContent = "";
+  confirmUnknown.textContent = "";
 }
 
 function refusal(headline, why) {
@@ -1740,13 +1817,20 @@ async function prepareApprovedAction(a, exec) {
   if (norm.fingerprint !== a.fingerprint || norm.targets.length !== a.controlCount) {
     return refusal("Not done: the page changed since the proposal.", "Other controls were added, removed or changed. Make a new proposal.");
   }
+  if (a.action === "search") {
+    // The state the proposal started from: how it submits, and what the box held.
+    if (!sameSearchPath(a.search, current.search)) return refusal("Not done: the way to submit the search changed.", "The search button or form differs from the one you approved. Nothing was done.");
+    if (current.value !== a.initialValue || current.valueLen !== a.initialValueLen) {
+      return refusal("Not done: the search box content changed since the proposal.", "It no longer holds what it held when you were shown the plan. Nothing was done.");
+    }
+  }
 
   // The same rules as for the proposal, applied to the control as it is NOW.
   const version = `a${++actionCounter}`;
   const records = buildActionRecords(norm, version);
   packTargets(records, ACTION_TARGET_BUDGET_CHARS);
   const reply = JSON.stringify({ ...a.proposal, target_id: current ? `${version}:E${current.n}` : "" });
-  const check = validateActionReply(reply, a.goal, { version, records, scroll: norm.scroll });
+  const check = validateActionReply(reply, a.goal, { version, records, scroll: norm.scroll, viewport: norm.viewport });
   if (check.kind !== "valid") {
     const why = check.kind === "rejected" ? [...check.blocks, ...check.invalid].join(" ") : check.reasons.join(" ");
     const blocked = check.kind === "rejected" && check.blocks.length > 0;
@@ -1762,11 +1846,54 @@ async function prepareApprovedAction(a, exec) {
     step = plan.step;
   }
   const spec = { action: a.action, token: a.documentToken, key: a.key, signature: a.signature, kind: a.kind, text: a.text, direction: a.direction, step };
+  if (a.action === "search") {
+    spec.initialValue = a.initialValue;
+    spec.submit = {
+      via: a.search.via,
+      key: a.search.submit ? a.search.submit.key : 0,
+      signature: a.search.submit ? a.search.submit.signature : "",
+      formKey: a.search.formKey,
+    };
+  }
   return { spec, norm, current };
 }
 
-// Turn the page's reply into words. Only values that are bounded integers or fixed words are shown.
-function describeDispatchResult(a, r, beforeCount, after) {
+// Did the search show results? Only when the new capture says so: the page changed AND the query's
+// words are in its address or title. The address is used for this check only and is not kept or shown.
+function observeSearchResults(a, after) {
+  if (!after) return { observed: false, text: "The page could not be captured again, so results could not be observed." };
+  const words = wordsOf(a.text);
+  const changed = after.norm.documentToken !== a.documentToken || after.url !== a.urlStripped;
+  let address = "";
+  try {
+    address = decodeURIComponent(String(after.rawUrl || "").replace(/\+/g, " ")).toLowerCase();
+  } catch (_) {
+    address = String(after.rawUrl || "").toLowerCase();
+  }
+  const title = String(after.norm.title || "").toLowerCase();
+  const inAddress = words.length > 0 && words.every((w) => address.includes(w));
+  const inTitle = words.length > 0 && words.every((w) => title.includes(w));
+  if (changed && (inAddress || inTitle)) {
+    return { observed: true, text: `Results observed: the page changed and its ${inAddress ? "address" : "title"} contains your query.` };
+  }
+  if (changed) return { observed: false, text: "The page changed after the search was submitted, but your query was not visible in its address or title, so Cloudy cannot say results are showing." };
+  return { observed: false, text: "Nothing about the page changed after the search was submitted, so results are not observed (the site may update in place, or may have rejected the input)." };
+}
+
+// What the new capture shows about a field Cloudy filled (an ordinary field, so its value is readable).
+function observeFieldValue(a, after) {
+  if (!after) return "The page could not be captured again, so the field could not be checked.";
+  if (after.norm.documentToken !== a.documentToken) return "The page was replaced, so the field could not be checked in the new capture.";
+  const t = after.norm.targets.find((x) => x.key === a.key);
+  if (!t) return "The field is no longer in the new capture.";
+  if (t.value === null || t.valueWithheld) return "The field's value is not readable in the new capture.";
+  return t.value === a.text && t.valueLen === a.text.length
+    ? `The new capture shows the field holds exactly ${JSON.stringify(a.text)}.`
+    : "The new capture shows the field holds something different from the text.";
+}
+
+// Turn the page's reply into words. Only bounded integers and fixed words from the reply are used.
+function describeDispatchResult(a, r, after) {
   if (a.action === "scroll") {
     const moved = actInt(r.moved, 1e7);
     const from = actInt(r.before, 1e8);
@@ -1774,30 +1901,53 @@ function describeDispatchResult(a, r, beforeCount, after) {
     const max = actInt(r.max, 1e8);
     let effect = `The page scrolled ${a.direction} by ${moved} px (position ${from} to ${to} of ${max}).`;
     if (after && after.norm) effect += ` The new capture reads position ${after.norm.scroll.top} of ${after.norm.scroll.max}.`;
-    return effect;
+    return { effect, resultsObserved: false };
   }
   if (a.action === "type") {
-    return "The approved text was sent to the field. Cloudy never reads field values, so it cannot confirm what the field now holds.";
+    return { effect: `The approved text was sent to the field; nothing was submitted. ${observeFieldValue(a, after)}`, resultsObserved: false };
+  }
+  if (a.action === "search") {
+    const steps = Array.isArray(r.steps) ? r.steps : [];
+    const fill = steps.find((s) => s && s.step === "fill");
+    const via = steps.find((s) => s && s.step === "submit" && s.done === true);
+    const did = `${fill && fill.skipped === true ? "The field already held exactly the query, so it was not retyped" : "The field was filled with the query"}; the search was submitted ${via && via.via === "control" ? "by clicking its search button" : "by requesting submit on its search form (the browser's own validation and the site's handling apply)"}.`;
+    const results = observeSearchResults(a, after);
+    return { effect: `${did} ${results.text}`, resultsObserved: results.observed };
   }
   // click: only what the new capture can show
-  if (!after) return "The click was dispatched. The page could not be captured again, so no effect could be observed.";
+  if (!after) return { effect: "The click was dispatched. The page could not be captured again, so no effect could be observed.", resultsObserved: false };
   const bits = [];
   if (after.norm.documentToken !== a.documentToken) bits.push("the page navigated or reloaded");
   else if (after.url !== a.urlStripped) bits.push("the page address changed");
   const n = after.norm.targets.length;
-  if (n !== beforeCount) bits.push(`the number of controls went from ${beforeCount} to ${n}`);
-  return bits.length > 0
-    ? `Observed after the click: ${bits.join("; ")}.`
-    : "No change in the page's control list was observed. The click may still have had an effect Cloudy cannot see.";
+  if (n !== a.controlCount) bits.push(`the number of controls went from ${a.controlCount} to ${n}`);
+  return {
+    effect: bits.length > 0
+      ? `Observed after the click: ${bits.join("; ")}.`
+      : "No change in the page's control list was observed. The click may still have had an effect Cloudy cannot see.",
+    resultsObserved: false,
+  };
 }
 
-async function captureAfter(a) {
+async function captureAfter() {
   const { tab } = await getReadableTab();
   const norm = await readActionTargets(tab.id);
   const version = `a${++actionCounter}`;
   const records = buildActionRecords(norm, version);
   const packed = packTargets(records, ACTION_TARGET_BUDGET_CHARS);
-  return { norm, version, packed, url: stripUrl(tab.url) };
+  return { norm, version, packed, url: stripUrl(tab.url), rawUrl: tab.url };
+}
+
+// After a dispatch (or a partly executed operation): capture again unless Stop was pressed. Never asks the model.
+async function captureAfterDispatch(a, exec) {
+  if (exec.cancelled) return { after: null, afterError: "You pressed Stop after the action had run, so the follow-up capture was skipped." };
+  setStatus("Action dispatched. Capturing the page again (no further step is requested)...");
+  await settleTab(a.tabId);
+  try {
+    return { after: await captureAfter(), afterError: "" };
+  } catch (error) {
+    return { after: null, afterError: error.message };
+  }
 }
 
 // The whole approved run. Always resolves to a result object; it never throws.
@@ -1806,7 +1956,7 @@ async function runApproved(a, exec) {
   if (!prepared.spec) return prepared;
   if (exec.cancelled) return cancelledResult(exec); // last look: no await between this and the next line
   exec.dispatching = true;
-  setStatus("Dispatching the one approved action...");
+  setStatus("Dispatching the one approved operation...");
 
   let reply;
   try {
@@ -1831,37 +1981,38 @@ async function runApproved(a, exec) {
   if (!reply || typeof reply.ok !== "boolean") {
     return { state: "unconfirmed", headline: "Dispatch not confirmed.", why: "The page returned no answer. The action may or may not have run; check the page." };
   }
+  if (!reply.ok && reply.partial === true) {
+    // Some steps ran, then it stopped on something unexpected. Say exactly that.
+    const steps = Array.isArray(reply.steps) ? reply.steps : [];
+    const filled = steps.some((s) => s && s.step === "fill" && s.done === true);
+    const { after, afterError } = await captureAfterDispatch(a, exec);
+    return {
+      state: "partial",
+      headline: `Partly executed: ${filled ? `the field was filled with ${JSON.stringify(a.text)}` : "nothing was filled"}, but the search was NOT submitted.`,
+      why: actClip(String(reply.reason || "It stopped on an unexpected change."), 220),
+      after,
+      afterError,
+      effect: filled ? `The field was changed and left as it is. ${observeFieldValue(a, after)}` : "",
+    };
+  }
   if (!reply.ok) {
     return { state: "failed", headline: "Failed: the action was not dispatched.", why: actClip(String(reply.reason || "The page refused it."), 200) };
   }
 
   // Dispatched. Capture again (unless Stop was pressed), and stop there.
-  let after = null;
-  let afterError = "";
-  if (!exec.cancelled) {
-    setStatus("Action dispatched. Capturing the page again (no further step is requested)...");
-    await settleTab(a.tabId);
-    try {
-      after = await captureAfter(a);
-    } catch (error) {
-      afterError = error.message;
-    }
-  } else {
-    afterError = "You pressed Stop after the action had run, so the follow-up capture was skipped.";
-  }
-  return { state: "dispatched", reply, after, afterError, effect: describeDispatchResult(a, reply, a.controlCount, after) };
+  const { after, afterError } = await captureAfterDispatch(a, exec);
+  const described = describeDispatchResult(a, reply, after);
+  return { state: "dispatched", reply, after, afterError, effect: described.effect, resultsObserved: described.resultsObserved };
 }
 
 function showExecutionResult(a, result) {
   executionSection.hidden = false;
-  executionAction.textContent = `Approved step: ${a.description}`;
+  executionAction.textContent = `Approved ${a.action === "search" ? "operation" : "step"}: ${a.description}`;
   executionEffect.textContent = "";
   executionPage.textContent = "";
   afterDetails.hidden = true;
   afterText.textContent = "";
-  if (result.state === "dispatched") {
-    executionStatus.textContent = "Action dispatched. (A dispatched action is not undone by Stop.)";
-    executionEffect.textContent = result.effect;
+  const showAfter = () => {
     if (result.after) {
       const n = result.after.norm;
       executionPage.textContent = `Page captured again as ${result.after.version}: ${n.targets.length} control(s)${n.capped ? " (scan limit reached)" : ""}. No model call was made, and nothing more will run until you ask for a new proposal and approve it.`;
@@ -1871,23 +2022,32 @@ function showExecutionResult(a, result) {
     } else {
       executionPage.textContent = `${result.afterError} No model call was made, and nothing more will run.`.trim();
     }
+  };
+  if (result.state === "dispatched") {
+    executionStatus.textContent = a.action === "search"
+      ? `${result.resultsObserved ? "Search submitted; results observed." : "Search submit requested; results NOT observed."} A dispatched step is not undone by Stop.`
+      : "Action dispatched. (A dispatched action is not undone by Stop.)";
+    executionEffect.textContent = result.effect;
+    showAfter();
+  } else if (result.state === "partial") {
+    executionStatus.textContent = `${result.headline} ${result.why}`;
+    executionEffect.textContent = result.effect || "";
+    showAfter();
   } else {
     executionStatus.textContent = `${result.headline} ${result.why || ""}`.trim();
-    executionEffect.textContent = "No action was dispatched." + (result.state === "unconfirmed" ? " (Not known: see above.)" : "");
-    if (result.state === "unconfirmed") executionEffect.textContent = "It is not known whether the action ran.";
+    executionEffect.textContent = result.state === "unconfirmed" ? "It is not known whether the action ran." : "No action was dispatched.";
   }
   executionGoal.textContent = "Goal verified: no. Cloudy does not judge whether your goal was met; look at the page yourself.";
 }
 
-// The Approve button. Everything up to and including consuming the approval is synchronous, so
-// a second click (or a double click) finds nothing to approve.
-async function approveProposal() {
-  const approval = pendingApproval;
-  if (!approval || approval.consumed || inFlight || activeExecution) return;
+// Consumes the approval FIRST (synchronously, before any await), so a second click or a double
+// click finds nothing left to approve, then runs the one operation.
+async function startApproved(approval) {
   approval.consumed = true;
   pendingApproval = null;
   approveButton.hidden = true;
   approveButton.disabled = true;
+  hideConfirmation();
   const exec = { approval, cancelled: false, cancelReason: "", dispatching: false };
   activeExecution = exec;
   setBusy(true);
@@ -1907,9 +2067,40 @@ async function approveProposal() {
     setBusy(false);
   }
   showExecutionResult(approval, result);
-  if (result.state === "dispatched") setStatus(`Action dispatched. ${result.effect} Goal not verified.`);
+  if (result.state === "dispatched") {
+    setStatus(approval.action === "search"
+      ? `${result.resultsObserved ? "Search submitted." : "Search submit requested."} ${result.effect} Goal not verified.`
+      : `Action dispatched. ${result.effect} Goal not verified.`);
+  } else if (result.state === "partial") setStatus(`${result.headline} ${result.why}`, true);
   else if (result.state === "unconfirmed") setStatus(`${result.headline} ${result.why}`, true);
   else setStatus(`${result.headline} ${result.why || ""}`.trim(), true);
+}
+
+// The Approve button. A consequential-looking step shows its confirmation first and runs nothing.
+async function approveProposal() {
+  const approval = pendingApproval;
+  if (!approval || approval.consumed || inFlight || activeExecution) return;
+  if (approval.confirm && !approval.confirmed) {
+    showConfirmation(approval);
+    return;
+  }
+  await startApproved(approval);
+}
+
+// The second, explicit step for a consequential-looking control.
+async function confirmProposal() {
+  const approval = pendingApproval;
+  if (!approval || approval.consumed || inFlight || activeExecution || !approval.confirm || confirmBox.hidden) return;
+  approval.confirmed = true;
+  await startApproved(approval);
+}
+
+function cancelConfirmation() {
+  hideConfirmation();
+  if (pendingApproval && !pendingApproval.consumed) {
+    approveButton.hidden = false;
+    approveButton.disabled = inFlight;
+  }
 }
 
 // Separate mode: never runs for Send or Ask. The goal is what the user typed.
@@ -1959,6 +2150,64 @@ function stopRequest() {
   }
 }
 
+function showLiveCapture() {
+  liveCaptureEl.textContent = liveCapture
+    ? `Live capture (automatic, no model call): ${JSON.stringify(liveCapture.title || "(no title)")}, ${liveCapture.count} control(s).`
+    : "Live capture: none for the active page.";
+}
+
+// Called by every tab event that can change what the active page is. Capture only.
+function scheduleAutoCapture() {
+  if (!autoEnabled) return;
+  autoSeq++; // whatever is already running is now late
+  if (autoTimer !== null) clearTimeout(autoTimer);
+  autoTimer = setTimeout(runAutoCapture, AUTO_DEBOUNCE_MS);
+}
+
+async function runAutoCapture() {
+  autoTimer = null;
+  if (!autoEnabled) return;
+  if (inFlight) {
+    autoPending = true; // do not interleave with a model request or an approved action
+    return;
+  }
+  const mine = autoSeq;
+  try {
+    const access = await assessActiveTab(); // the same access / restricted-page checks as every capture
+    if (!autoEnabled || mine !== autoSeq) return;
+    showAccessState(access);
+    if (access.state !== "readable") {
+      liveCapture = null;
+      showLiveCapture();
+      return;
+    }
+    const tab = access.tab;
+    const norm = await readActionTargets(tab.id);
+    if (!autoEnabled || mine !== autoSeq) return; // an event arrived while reading: this one is late
+    // Discard it too if the active tab, or its address, is no longer the one that was read.
+    const now = await getActiveTab();
+    if (!autoEnabled || mine !== autoSeq || !now || now.id !== tab.id || stripUrl(now.url || "") !== stripUrl(tab.url)) return;
+    liveCapture = { tabId: tab.id, urlStripped: stripUrl(tab.url), documentToken: norm.documentToken, title: norm.title, count: norm.targets.length, capturedAt: Date.now() };
+    showLiveCapture();
+  } catch (_) {
+    if (autoEnabled && mine === autoSeq) {
+      liveCapture = null;
+      showLiveCapture();
+    }
+  }
+}
+
+// The side panel closing ends the page: stop capturing, drop anything pending.
+if (typeof window !== "undefined" && window.addEventListener) {
+  window.addEventListener("pagehide", () => {
+    autoEnabled = false;
+    autoSeq++;
+    if (autoTimer !== null) clearTimeout(autoTimer);
+    autoTimer = null;
+    liveCapture = null;
+  });
+}
+
 // A tab switch, navigation or close before the dispatch ends the pending action. (After the
 // dispatch there is nothing left to cancel.) `activeTabId` -1 means "the approved tab itself".
 function cancelUndispatchedExecution(activeTabId, reason) {
@@ -1986,6 +2235,8 @@ input.addEventListener("keydown", (event) => {
 
 stopButton.addEventListener("click", stopRequest);
 approveButton.addEventListener("click", approveProposal);
+confirmButton.addEventListener("click", confirmProposal);
+cancelConfirmButton.addEventListener("click", cancelConfirmation);
 askPageButton.addEventListener("click", askAboutPage);
 suggestButton.addEventListener("click", suggestNextAction);
 
@@ -1994,6 +2245,12 @@ suggestButton.addEventListener("click", suggestNextAction);
 if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
   chrome.tabs.onActivated.addListener(({ tabId }) => {
     cancelUndispatchedExecution(tabId, "You switched tabs before the action ran.");
+    // Any approval belongs to the page that was shown, so it ends the moment the active tab changes.
+    dropApproval();
+    if (actionContext) invalidateProposal("You switched tabs.");
+    liveCapture = null;
+    showLiveCapture();
+    scheduleAutoCapture();
     refreshAccessState();
     if (pageContext && tabId !== pageContext.tabId) {
       clearPageContext("You switched tabs, so the earlier capture was cleared.");
@@ -2002,8 +2259,11 @@ if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
       invalidateProposal("You switched tabs.");
     }
   });
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tabInfo) => {
     const navigated = changeInfo.status === "loading" || changeInfo.url;
+    if (navigated) dropApproval();
+    // Capture the active page once it is ready or has navigated (never an inactive tab).
+    if ((changeInfo.status === "complete" || changeInfo.url) && !(tabInfo && tabInfo.active === false)) scheduleAutoCapture();
     if (navigated && activeExecution && tabId === activeExecution.approval.tabId) {
       cancelUndispatchedExecution(-1, "The page navigated before the action ran.");
     }
