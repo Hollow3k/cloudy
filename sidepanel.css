@@ -155,6 +155,17 @@ textarea:focus-visible {
   margin-top: 0;
 }
 
+#access-state {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+
+#access-state.unavailable {
+  border-left: 3px solid var(--black);
+  padding-left: 8px;
+  font-weight: 600;
+}
+
 #page-info {
   margin: 0;
   overflow-wrap: anywhere;
@@ -261,4 +272,77 @@ textarea:focus-visible {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: inherit;
+}
+
+/* Suggest next action: a proposal card. Black and white only; a rejected or
+   stale proposal gets a dashed border instead of a color. */
+.proposal {
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid var(--black);
+  border-left-width: 4px;
+  border-radius: 8px;
+}
+
+.proposal.rejected {
+  border-style: dashed;
+  border-left-style: solid;
+}
+
+.proposal h2 {
+  margin-top: 0;
+}
+
+.proposal p {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
+
+#proposal-banner {
+  font-weight: 600;
+}
+
+#proposal-action {
+  /* Sans, not the condensed serif: quoted names and IDs must be read exactly. */
+  font: 600 15px/1.4 var(--sans);
+}
+
+#proposal-rationale,
+#proposal-coverage,
+#proposal-note {
+  font-size: 12px;
+}
+
+.proposal ul {
+  margin: 6px 0 0;
+  padding: 0 0 0 18px;
+  font-size: 12px;
+}
+
+.proposal ul.warnings {
+  font-weight: 600;
+}
+
+.proposal pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px dashed var(--black);
+  border-radius: 8px;
+  font: 11px/1.4 ui-monospace, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.proposal summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 8px;
+}
+
+#ask-page-button,
+#suggest-button {
+  font-size: 13px;
 }

@@ -9,7 +9,7 @@ const results = [];
 const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  -> " + String(extra).slice(0, 200) : ""}`);
 
 class FakeEl {
-  constructor(tag) { this.tag = tag; this.children = []; this._text = ""; this.className = ""; this.listeners = {}; this.hidden = false; this.open = false; this.disabled = false; this.readOnly = false; this.value = ""; this.isError = false; const self = this; this.classList = { toggle(c, on) { if (c === "error") self.isError = !!on; } }; }
+  constructor(tag) { this.tag = tag; this.children = []; this._text = ""; this.className = ""; this.listeners = {}; this.hidden = false; this.open = false; this.disabled = false; this.readOnly = false; this.value = ""; this.isError = false; const self = this; this.classes = new Set(); this.classList = { toggle(c, on) { if (c === "error") self.isError = !!on; on ? self.classes.add(c) : self.classes.delete(c); }, add(c) { self.classes.add(c); }, remove(c) { self.classes.delete(c); }, contains(c) { return self.classes.has(c); } }; }
   get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); }
   set textContent(v) { this._text = String(v); this.children = []; }
   appendChild(c) { this.children.push(c); return c; }
@@ -19,7 +19,7 @@ class FakeEl {
   walk(fn) { fn(this); this.children.forEach((c) => c.walk(fn)); }
 }
 const ids = {};
-["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings"].forEach((i) => (ids[i] = new FakeEl(i)));
+["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "access-state", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings", "suggest-button", "proposal-section", "proposal-banner", "proposal-action", "proposal-rationale", "proposal-checks", "proposal-warnings", "proposal-coverage", "proposal-note", "targets-details", "targets-text", "raw-reply-details", "raw-reply-text"].forEach((i) => (ids[i] = new FakeEl(i)));
 global.document = { getElementById: (i) => ids[i], createElement: (t) => new FakeEl(t) };
 Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async () => {} } }, configurable: true });
 const handlers = {};
@@ -27,6 +27,7 @@ let tabQueue = []; let scriptImpl = null; let scriptCalls = [];
 global.chrome = {
   tabs: { query: async () => { const t = tabQueue.length > 1 ? tabQueue.shift() : tabQueue[0]; return t ? [t] : []; },
     onActivated: { addListener: (f) => (handlers.activated = f) }, onUpdated: { addListener: (f) => (handlers.updated = f) }, onRemoved: { addListener: (f) => (handlers.removed = f) } },
+  permissions: { contains: async () => true },
   scripting: { executeScript: async (o) => { scriptCalls.push(o); return scriptImpl(o); } },
 };
 let fetchCalls = []; let fetchImpl = null;
@@ -178,7 +179,7 @@ const ask = async () => { ids["ask-page-button"].fire("click"); await tick(40); 
   ok("I: no site-specific names anywhere in the code", !/mdn|mozilla|wikipedia|example\.com|#content\b|\.sidebar|\.layout/i.test(code));
   ok("I: the extractor never looks at class names, ids or page keywords", !/getElementsByClassName|\.className|classList|\.id\b\s*[=!]==?|\[class|\[id|cookie|consent|navbar/i.test(strip("capture.js")));
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
-  ok("I: permissions unchanged", JSON.stringify(manifest.permissions) === '["sidePanel","activeTab","scripting"]' && JSON.stringify(manifest.host_permissions) === '["http://localhost:11434/*"]');
+  ok("I: permissions as intended (broad http/https host access)", JSON.stringify(manifest.permissions) === '["sidePanel","activeTab","scripting"]' && JSON.stringify(manifest.host_permissions) === '["http://localhost:11434/*","https://*/*","http://*/*"]' && !JSON.stringify(manifest).includes("<all_urls>") && !manifest.permissions.includes("tabs"));
   ok("I: budget, model, timeout, question limit unchanged; no num_ctx", SNAPSHOT_BUDGET_CHARS === 4000 && MODEL === "qwen3:4b-instruct" && TIMEOUT_MS === 180000 && MAX_QUESTION_CHARS === 500 && !/num_ctx|options\s*:/.test(code));
   ok("I: ID pattern still H/L/N/C/T only", ID_PATTERN.test("s1:N3") && ID_PATTERN.test("s1:T") && !ID_PATTERN.test("s1:X1"));
 

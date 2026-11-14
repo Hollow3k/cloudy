@@ -185,7 +185,7 @@ const textOf = (v) => v.all + v.reply + v.status;
   p.useCapture("mdn_live"); await p.ask("q", { status: "answered", answer: "<img src=x onerror=alert(1)> and <b>bold</b>", entries: ["<script>alert(1)</script>"], citations: ["<img src=x>"] }); v = p.view();
   ok("9: markup in the answer and in IDs is inert text (shown literally, no element created)", v.reply === "<img src=x onerror=alert(1)> and <b>bold</b>" && v.warnings.length === 2 && v.warnings.every((w) => /not a valid evidence ID/.test(w)) && ![p.ids.reply, ...v.listedEls, ...v.cardEls].some((e) => { let bad = false; e.walk((n) => { if (["img", "script", "b"].includes(n.tag)) bad = true; }); return bad; }));
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
-  ok("9: permissions unchanged", JSON.stringify(manifest.permissions) === '["sidePanel","activeTab","scripting"]' && JSON.stringify(manifest.host_permissions) === '["http://localhost:11434/*"]');
+  ok("9: permissions as intended (broad http/https host access)", JSON.stringify(manifest.permissions) === '["sidePanel","activeTab","scripting"]' && JSON.stringify(manifest.host_permissions) === '["http://localhost:11434/*","https://*/*","http://*/*"]' && !JSON.stringify(manifest).includes("<all_urls>") && !manifest.permissions.includes("tabs"));
   p.ids["prompt-input"].value = "say ready"; p.reply("ready"); p.state.fetchCalls = []; p.ids["prompt-form"].fire("submit", { preventDefault() {} }); await p.tick(40); v = p.view();
   ok("9: plain chat untouched: no format/system, reply as-is, no sources", !("format" in p.state.fetchCalls[0].body) && !("system" in p.state.fetchCalls[0].body) && v.reply === "ready" && v.status === "Done." && v.sourcesHidden === true);
 

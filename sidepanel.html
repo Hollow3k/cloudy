@@ -24,14 +24,18 @@
         </div>
         <div class="buttons">
           <button type="button" id="ask-page-button">Ask about this page</button>
+          <button type="button" id="suggest-button">Suggest next action</button>
         </div>
         <p class="hint">
-          Send is plain chat. Only "Ask about this page" reads the active tab.
+          Send is plain chat. "Ask about this page" reads the active tab and answers a
+          question. "Suggest next action" reads the tab's controls and proposes ONE step
+          toward the goal you typed. It only proposes: nothing is clicked or typed.
         </p>
       </form>
 
       <section class="page-context" aria-labelledby="page-context-heading">
         <h2 id="page-context-heading">Page context</h2>
+        <p id="access-state">Checking page access...</p>
         <p id="page-info">No page captured.</p>
         <details id="excerpt-details" hidden>
           <summary>Show exactly what was captured</summary>
@@ -54,20 +58,44 @@
         <ul id="sources-warnings" class="warnings"></ul>
       </section>
 
+      <section id="proposal-section" class="proposal" aria-labelledby="proposal-heading" hidden>
+        <h2 id="proposal-heading">Proposed next action</h2>
+        <p id="proposal-banner"></p>
+        <p id="proposal-action"></p>
+        <p id="proposal-rationale"></p>
+        <ul id="proposal-checks"></ul>
+        <ul id="proposal-warnings" class="warnings"></ul>
+        <p id="proposal-coverage"></p>
+        <details id="targets-details" hidden>
+          <summary>Show the controls sent to the model</summary>
+          <pre id="targets-text"></pre>
+        </details>
+        <details id="raw-reply-details" hidden>
+          <summary>Show the model's raw reply (unverified)</summary>
+          <pre id="raw-reply-text"></pre>
+        </details>
+        <p id="proposal-note"></p>
+      </section>
+
       <p class="note">
         Stop cancels the browser's request. It does not prove Ollama stopped
         computing; the server may finish the current generation on its own.
       </p>
       <p class="note">
-        To let Cloudy read a page, first click Cloudy's toolbar icon while that
-        tab is active; buttons inside this panel do not grant access. Only the
+        Cloudy can read ordinary http and https pages without a toolbar click.
+        It cannot read chrome:// pages, the Chrome Web Store or other pages
+        Chrome restricts. If you set Cloudy's Site access to "On click" or "On
+        specific sites", click Cloudy's toolbar icon on the tab you want (buttons
+        inside this panel do not grant access). Only the
         main page's rendered text is read (not iframes, images, canvas or other
-        pages). Form values and editable text are never read, but visible text
-        can still contain personal information. It goes only to your local
+        pages). Form values and editable text are never read (not even to name a
+        control), but visible text can still contain personal information. It goes only to your local
         Ollama, is kept in memory, and is not stored.
       </p>
     </main>
     <script src="capture.js"></script>
+    <script src="targets.js"></script>
+    <script src="actions.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

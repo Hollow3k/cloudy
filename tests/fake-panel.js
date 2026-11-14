@@ -11,7 +11,7 @@ const out = path.join(__dirname, ".out");
 const root = path.join(__dirname, "..");
 
 class FakeEl {
-  constructor(tag) { this.tag = tag; this.children = []; this._text = ""; this.className = ""; this.listeners = {}; this.hidden = false; this.open = false; this.disabled = false; this.readOnly = false; this.value = ""; this.isError = false; const self = this; this.classList = { toggle(c, on) { if (c === "error") self.isError = !!on; } }; }
+  constructor(tag) { this.tag = tag; this.children = []; this._text = ""; this.className = ""; this.listeners = {}; this.hidden = false; this.open = false; this.disabled = false; this.readOnly = false; this.value = ""; this.isError = false; const self = this; this.classes = new Set(); this.classList = { toggle(c, on) { if (c === "error") self.isError = !!on; on ? self.classes.add(c) : self.classes.delete(c); }, add(c) { self.classes.add(c); }, remove(c) { self.classes.delete(c); }, contains(c) { return self.classes.has(c); } }; }
   get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); }
   set textContent(v) { this._text = String(v); this.children = []; }
   appendChild(c) { this.children.push(c); return c; }
@@ -21,7 +21,7 @@ class FakeEl {
   walk(fn) { fn(this); this.children.forEach((c) => c.walk(fn)); }
 }
 
-const ELEMENT_IDS = ["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings"];
+const ELEMENT_IDS = ["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "access-state", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings", "suggest-button", "proposal-section", "proposal-banner", "proposal-action", "proposal-rationale", "proposal-checks", "proposal-warnings", "proposal-coverage", "proposal-note", "targets-details", "targets-text", "raw-reply-details", "raw-reply-text"];
 
 function load(options = {}) {
   const ids = {};
@@ -31,23 +31,27 @@ function load(options = {}) {
   const handlers = {};
   let tabQueue = [];
   let scriptImpl = () => [];
+  let tabFn = null; // optional: compute the active tab at each query
   global.chrome = {
-    tabs: { query: async () => { const t = tabQueue.length > 1 ? tabQueue.shift() : tabQueue[0]; return t ? [t] : []; },
+    tabs: { query: async () => { if (tabFn) { const x = tabFn(); return x ? [x] : []; } const t = tabQueue.length > 1 ? tabQueue.shift() : tabQueue[0]; return t ? [t] : []; },
       onActivated: { addListener: (f) => (handlers.activated = f) }, onUpdated: { addListener: (f) => (handlers.updated = f) }, onRemoved: { addListener: (f) => (handlers.removed = f) } },
-    scripting: { executeScript: async (o) => scriptImpl(o) },
+    permissions: { contains: async (q) => { state.permCalls.push(JSON.stringify(q)); if (state.permThrows) throw new Error("boom"); return state.allSites; }, onAdded: { addListener: (f) => (handlers.permAdded = f) }, onRemoved: { addListener: (f) => (handlers.permRemoved = f) } },
+    scripting: { executeScript: async (o) => { state.scriptCalls.push({ func: o.func && o.func.name, keys: Object.keys(o).sort().join(","), target: JSON.stringify(o.target), world: o.world }); return scriptImpl(o); } },
   };
-  const state = { fetchCalls: [], fetchImpl: null };
+  const state = { fetchCalls: [], fetchImpl: null, scriptCalls: [], permCalls: [], allSites: true, permThrows: false };
   const realFetch = global.fetch;
   global.fetch = (url, opts) => { state.fetchCalls.push({ url, body: JSON.parse(opts.body), signal: opts.signal }); return state.fetchImpl(url, opts); };
   if (options.live) state.fetchImpl = (url, opts) => realFetch(url, opts); // real local Ollama
   const realST = setTimeout;
   if (!options.live) global.setTimeout = (f, ms) => (ms === 180000 ? realST(f, 120) : realST(f, ms));
 
-  const names = "ID_PATTERN,MAX_CITED,MAX_REPLY_IDS,parseStructuredReply,resolveCitations,renderSources,buildEvidence,buildPagePrompt,normalizeSnapshot,runRequest,REPLY_SCHEMA,PAGE_SYSTEM_PROMPT,MODEL,OLLAMA_URL,SNAPSHOT_BUDGET_CHARS,TIMEOUT_MS,MAX_QUESTION_CHARS".split(",");
+  const names = "assessActiveTab,refreshAccessState,showAccessState,getReadableTab,captureActionContext,evaluateActionReply,renderProposal,ACTION_SCHEMA,ACTION_SYSTEM_PROMPT,ACTION_NAMES,TARGET_LIMITS,ACTION_TARGET_BUDGET_CHARS,validateActionReply,parseActionReply,normalizeTargetCapture,buildActionRecords,packTargets,buildActionPrompt,describeProposal,ID_PATTERN,MAX_CITED,MAX_REPLY_IDS,parseStructuredReply,resolveCitations,renderSources,buildEvidence,buildPagePrompt,normalizeSnapshot,runRequest,REPLY_SCHEMA,PAGE_SYSTEM_PROMPT,MODEL,OLLAMA_URL,SNAPSHOT_BUDGET_CHARS,TIMEOUT_MS,MAX_QUESTION_CHARS".split(",");
   const src = fs.readFileSync(process.env.SIDEPANEL_SRC || path.join(root, "sidepanel.js"), "utf8").replace(/^const /gm, "var ").replace(/^let /gm, "var ");
-  const factory = new Function("capturePageSnapshot", src + `\nreturn { ${names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}, getPageContext: () => pageContext, getSnapshotCounter: () => snapshotCounter };`);
+  const actionsSrc = fs.readFileSync(process.env.ACTIONS_SRC || path.join(root, "actions.js"), "utf8").replace(/^const /gm, "var ").replace(/^let /gm, "var ");
+  const factory = new Function("capturePageSnapshot", "captureActionTargets", actionsSrc + "\n" + src + `\nreturn { ${names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}, getPageContext: () => pageContext, getSnapshotCounter: () => snapshotCounter, getActionContext: () => actionContext, setActionContext: (c) => { actionContext = c; }, getActionCounter: () => actionCounter };`);
   const capFn = new Function(fs.readFileSync(path.join(root, "capture.js"), "utf8") + "\nreturn capturePageSnapshot;")();
-  const api = factory(capFn);
+  const tgtFn = new Function(fs.readFileSync(process.env.TARGETS_SRC || path.join(root, "targets.js"), "utf8") + "\nreturn captureActionTargets;")();
+  const api = factory(capFn, tgtFn);
 
   const tick = (ms = 25) => new Promise((r) => realST(r, ms));
   const tabA = { id: 7, url: "https://site.test/page?x=1" };
@@ -59,7 +63,49 @@ function load(options = {}) {
     ids, api, tick, handlers, state, snap,
     useCapture(name) { tabQueue = [tabA]; scriptImpl = () => [{ result: snap(name) }]; },
     useSnapshotObject(obj) { tabQueue = [tabA]; scriptImpl = () => [{ result: obj }]; },
-    setTabs(list) { tabQueue = list; },
+    setTabs(list) { tabQueue = list; tabFn = null; },
+    setTabFn(fn) { tabFn = fn; },
+    setAllSites(v) { state.allSites = v; },
+    // "Suggest next action" fixtures: { snapshot, targets } from tests/.out/<name>.json.
+    // Successive target captures come from `seq` (the last one repeats), so a test can
+    // make the page "change" between the capture and the recheck.
+    actionFixture(name) {
+      const d = JSON.parse(fs.readFileSync(path.join(out, name + ".json"), "utf8"));
+      d.snapshot.url = "https://site.test/page"; d.snapshot.readyState = "complete";
+      d.targets.url = "https://site.test/page";
+      return d;
+    },
+    useAction(nameOrData, seq) {
+      const d = typeof nameOrData === "string" ? panel.actionFixture(nameOrData) : { snapshot: { ...nameOrData.snapshot, url: "https://site.test/page", readyState: "complete" }, targets: { ...nameOrData.targets, url: "https://site.test/page" } };
+      const list = seq ? seq.map((x) => ({ ...x, url: "https://site.test/page" })) : [d.targets];
+      tabFn = null; tabQueue = [tabA];
+      scriptImpl = (o) => {
+        if (o.func && o.func.name === "captureActionTargets") { const r = list.length > 1 ? list.shift() : list[0]; return [{ result: r }]; }
+        return [{ result: d.snapshot }];
+      };
+      return d;
+    },
+    async suggest(goal, replyObj) {
+      state.fetchCalls = [];
+      ids["prompt-input"].value = goal;
+      if (replyObj !== undefined) panel.reply(replyObj);
+      ids["suggest-button"].fire("click");
+      await tick(80);
+      for (let w = 0; options.live && w < 600 && ids["stop-button"].disabled === false; w++) await tick(500);
+    },
+    actionView() {
+      const kids = (el) => el.children.map((c) => c.textContent);
+      return {
+        hidden: ids["proposal-section"].hidden, rejected: ids["proposal-section"].classes.has("rejected"),
+        banner: ids["proposal-banner"].textContent, action: ids["proposal-action"].textContent,
+        rationale: ids["proposal-rationale"].textContent, checks: kids(ids["proposal-checks"]), warnings: kids(ids["proposal-warnings"]),
+        coverage: ids["proposal-coverage"].textContent, note: ids["proposal-note"].textContent,
+        targets: ids["targets-text"].textContent, targetsHidden: ids["targets-details"].hidden,
+        raw: ids["raw-reply-text"].textContent, rawHidden: ids["raw-reply-details"].hidden,
+        status: ids.status.textContent, isError: ids.status.isError, reply: ids.reply.textContent,
+        all: ["proposal-banner", "proposal-action", "proposal-rationale", "proposal-coverage", "proposal-note", "targets-text", "raw-reply-text"].map((k) => ids[k].textContent).join("|") + "|" + [ids["proposal-checks"], ids["proposal-warnings"]].map((e) => e.children.map((c) => c.textContent).join("|")).join("|"),
+      };
+    },
     setScript(fn) { scriptImpl = fn; },
     reply(r) { state.fetchImpl = async () => responseOf(r); },
     // Compute the reply from the live snapshot version/context (so IDs are valid).

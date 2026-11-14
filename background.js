@@ -4,8 +4,11 @@
 // Why not setPanelBehavior({ openPanelOnActionClick: true })?
 // Chrome does NOT grant the "activeTab" permission when the panel is opened
 // that way. By handling chrome.action.onClicked ourselves, the click counts as
-// a normal action click, which DOES grant temporary access to that tab. The
-// side panel's "Ask about this page" button relies on that access.
+// a normal action click, which DOES grant temporary access to that tab.
+//
+// Normal http/https pages are covered by host_permissions, so reading them
+// needs no click. The click only matters as a fallback when the user has set
+// Chrome's "Site access" for Cloudy to "On click" or "On specific sites".
 
 // An older version of Cloudy set this to true and Chrome remembers it, so turn
 // it off explicitly. (Otherwise onClicked would never fire.)

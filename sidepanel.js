@@ -78,8 +78,22 @@ const input = document.getElementById("prompt-input");
 const sendButton = document.getElementById("send-button");
 const stopButton = document.getElementById("stop-button");
 const askPageButton = document.getElementById("ask-page-button");
+const suggestButton = document.getElementById("suggest-button");
+const proposalSection = document.getElementById("proposal-section");
+const proposalBanner = document.getElementById("proposal-banner");
+const proposalAction = document.getElementById("proposal-action");
+const proposalRationale = document.getElementById("proposal-rationale");
+const proposalChecks = document.getElementById("proposal-checks");
+const proposalWarnings = document.getElementById("proposal-warnings");
+const proposalCoverage = document.getElementById("proposal-coverage");
+const proposalNote = document.getElementById("proposal-note");
+const targetsDetails = document.getElementById("targets-details");
+const targetsText = document.getElementById("targets-text");
+const rawReplyDetails = document.getElementById("raw-reply-details");
+const rawReplyText = document.getElementById("raw-reply-text");
 const statusEl = document.getElementById("status");
 const replyEl = document.getElementById("reply");
+const accessStateEl = document.getElementById("access-state");
 const pageInfoEl = document.getElementById("page-info");
 const excerptDetailsEl = document.getElementById("excerpt-details");
 const excerptEl = document.getElementById("excerpt");
@@ -106,6 +120,13 @@ let snapshotCounter = 0;
 // { version, tabId, title, url, truncated, snapshotText, records, counts }
 let pageContext = null;
 
+// "Suggest next action" keeps its own capture of the page's controls. Its IDs
+// are scoped the same way ("a3:E7"), so an ID from an older capture can never
+// resolve against a newer one. null when there is none. In memory only.
+// { version, tabId, urlStripped, goal, norm, records, packed, snapshot, capturedAt }
+let actionCounter = 0;
+let actionContext = null;
+
 function setStatus(message, isError = false) {
   statusEl.textContent = message; // textContent: never parsed as HTML
   statusEl.classList.toggle("error", isError);
@@ -115,6 +136,7 @@ function setBusy(busy) {
   inFlight = busy;
   sendButton.disabled = busy;
   askPageButton.disabled = busy;
+  suggestButton.disabled = busy;
   stopButton.disabled = !busy;
   input.readOnly = busy; // still focusable, but can't be edited mid-request
 }
@@ -145,6 +167,41 @@ function clearPageContext(reason) {
   excerptDetailsEl.open = false;
 }
 
+// ---- Proposal display (nothing here executes anything) ---------------------------
+
+function clearProposal() {
+  proposalSection.hidden = true;
+  proposalSection.classList.remove("rejected");
+  proposalBanner.textContent = "";
+  proposalAction.textContent = "";
+  proposalRationale.textContent = "";
+  proposalChecks.textContent = "";
+  proposalWarnings.textContent = "";
+  proposalCoverage.textContent = "";
+  proposalNote.textContent = "";
+  targetsDetails.hidden = true;
+  targetsDetails.open = false;
+  targetsText.textContent = "";
+  rawReplyDetails.hidden = true;
+  rawReplyDetails.open = false;
+  rawReplyText.textContent = "";
+}
+
+// The page, tab or document this proposal was made for is gone or changed:
+// keep the section but replace its content, so it cannot be read as current.
+function invalidateProposal(reason) {
+  actionContext = null;
+  if (proposalSection.hidden) return;
+  proposalSection.classList.add("rejected");
+  proposalBanner.textContent = `This proposal was cleared: ${reason} Capture the page again before relying on any proposal.`;
+  proposalAction.textContent = "";
+  proposalRationale.textContent = "";
+  proposalChecks.textContent = "";
+  proposalWarnings.textContent = "";
+  proposalNote.textContent = "";
+  rawReplyDetails.hidden = true;
+}
+
 function clearSources() {
   sourcesSection.hidden = true;
   sourcesNote.textContent = "";
@@ -164,9 +221,19 @@ function captureError(captureKind, message) {
   return error;
 }
 
+// Cloudy has host access to ordinary http/https sites, so no click is needed
+// there. This help applies when Chrome withholds that access (the user set
+// "Site access" to "On click" or "On specific sites").
 const ACCESS_HELP =
-  "Click Cloudy's toolbar icon while the page you want is the active tab, then click " +
-  '"Ask about this page" again. (Buttons inside this panel do not grant access.)';
+  'Chrome may be withholding site access for this page. Set Cloudy\'s "Site access" to "On all sites" ' +
+  "(chrome://extensions, Cloudy, Details), or click Cloudy's toolbar icon while this tab is active " +
+  "to allow it once, then try again. (Buttons inside this panel do not grant access.)";
+
+const RESTRICTED_HELP =
+  "Chrome doesn't let extensions read this page (chrome:// pages, the Chrome Web Store, other extensions' pages, " +
+  "local files and similar). Cloudy only reads ordinary http or https pages. Open one and try again.";
+
+const HTTP_ORIGIN_PATTERNS = ["https://*/*", "http://*/*"];
 
 async function getActiveTab() {
   let tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -202,7 +269,7 @@ function classifyScriptingError(message) {
   if (/frame.*(removed|detached)|navigat/i.test(message)) {
     return captureError(
       "changed",
-      "The page navigated while it was being read, so I discarded the result. Click Ask about this page again."
+      "The page navigated while it was being read, so I discarded the result. Try again."
     );
   }
   if (/cannot access|permission|host/i.test(message)) {
@@ -342,31 +409,118 @@ function normalizeSnapshot(raw) {
 
 // Capture a fresh snapshot of the active tab's main frame.
 // Returns { tabId, snapshot, version }. Throws an Error with kind "capture" on failure.
-async function captureActivePage() {
-  if (typeof chrome === "undefined" || !chrome.tabs || !chrome.scripting) {
-    throw captureError(
-      "unavailable",
-      "Page capture only works when Cloudy runs as an installed Chrome extension, not in a plain HTML preview."
+// The active tab, if Cloudy may read it. Shared by every mode that reads a page.
+async function getReadableTab() {
+  const access = await assessActiveTab();
+  accessRefreshCounter++; // this result is newer than any check still running
+  showAccessState(access);
+  if (access.state !== "readable") {
+    throw captureError(access.kind, access.message);
+  }
+  return { tab: access.tab, urlBefore: stripUrl(access.tab.url) };
+}
+
+// Pages Chrome never lets extensions read, even with host access.
+function isStoreUrl(url) {
+  try {
+    const u = new URL(url);
+    return (
+      u.hostname === "chromewebstore.google.com" ||
+      (u.hostname === "chrome.google.com" && u.pathname.startsWith("/webstore"))
     );
+  } catch (_) {
+    return false;
+  }
+}
+
+// Can Cloudy read the active tab right now? This checks Chrome's current state
+// (the tab's URL and the host access Chrome has granted). It injects nothing and
+// reads no page content, so it is safe to call on every tab event. The real
+// scripting call still decides in the end (see classifyScriptingError).
+//
+// Returns { state, kind, message, tab }:
+//   state "readable"     - kind and message are empty
+//   state "unavailable"  - kind is the capture error kind to throw
+async function assessActiveTab() {
+  if (typeof chrome === "undefined" || !chrome.tabs || !chrome.scripting) {
+    return {
+      state: "unavailable",
+      kind: "unavailable",
+      message: "Page capture only works when Cloudy runs as an installed Chrome extension, not in a plain HTML preview.",
+    };
   }
 
-  const tab = await getActiveTab();
+  let tab = null;
+  try {
+    tab = await getActiveTab();
+  } catch (_) {
+    tab = null;
+  }
   if (!tab || tab.id === undefined) {
-    throw captureError("no-tab", "No active tab was found.");
+    return { state: "unavailable", kind: "no-tab", message: "No active tab was found." };
   }
-  // tab.url is only visible if we currently have access to this tab. It is
-  // missing both when access was never granted and for restricted pages, and
-  // we can't tell those apart without the broader "tabs" permission.
+
+  // Without the "tabs" permission, tab.url is only filled in when Cloudy has
+  // access to that tab. It is missing for restricted pages (chrome://, the
+  // Web Store...) and for pages where Chrome withholds site access.
   if (!tab.url) {
-    throw captureError(
-      "no-access",
-      `Cloudy can't read this tab. Either access hasn't been granted, or it's a restricted page (chrome://, Chrome Web Store...). ${ACCESS_HELP}`
-    );
+    let allSites = null; // true / false, or null if Chrome can't tell us
+    try {
+      if (chrome.permissions && chrome.permissions.contains) {
+        allSites = await chrome.permissions.contains({ origins: HTTP_ORIGIN_PATTERNS });
+      }
+    } catch (_) {
+      allSites = null;
+    }
+    if (allSites === true) {
+      // Access to all sites is in force, so this page must be a restricted one.
+      return { state: "unavailable", kind: "restricted", message: RESTRICTED_HELP };
+    }
+    return {
+      state: "unavailable",
+      kind: "no-access",
+      message:
+        "Cloudy can't read this tab. Either Chrome is withholding site access, or it's a restricted page " +
+        `(chrome://, Chrome Web Store...). ${ACCESS_HELP}`,
+    };
   }
-  if (!/^https?:\/\//i.test(tab.url)) {
-    throw captureError("restricted", "Cloudy only reads ordinary http or https pages.");
+
+  if (!/^https?:\/\//i.test(tab.url) || isStoreUrl(tab.url)) {
+    return { state: "unavailable", kind: "restricted", message: RESTRICTED_HELP };
   }
-  const urlBefore = stripUrl(tab.url);
+  return { state: "readable", kind: "", message: "", tab };
+}
+
+// Passive indicator. Shows whether the active tab can be read, and drops any
+// earlier capture or proposal when it can't, so old page context never looks
+// current. Uses assessActiveTab only: no injection, no capture.
+function showAccessState(access) {
+  if (access.state === "readable") {
+    accessStateEl.textContent = "Page access: this page can be read.";
+    accessStateEl.classList.remove("unavailable");
+    return;
+  }
+  accessStateEl.textContent = `Page access: unavailable. ${access.message}`;
+  accessStateEl.classList.add("unavailable");
+  if (pageContext) clearPageContext("This tab can't be read, so the earlier capture was cleared.");
+  if (actionContext) invalidateProposal("This tab can't be read.");
+}
+
+let accessRefreshCounter = 0;
+async function refreshAccessState() {
+  const mine = ++accessRefreshCounter;
+  let access;
+  try {
+    access = await assessActiveTab();
+  } catch (_) {
+    return;
+  }
+  if (mine !== accessRefreshCounter) return; // a newer check is under way
+  showAccessState(access);
+}
+
+async function captureActivePage() {
+  const { tab, urlBefore } = await getReadableTab();
 
   const limits = {
     textChars: Math.floor(SNAPSHOT_BUDGET_CHARS * TEXT_SHARE),
@@ -423,7 +577,7 @@ async function captureActivePage() {
   ) {
     throw captureError(
       "changed",
-      "The tab changed or navigated while the page was being read, so I discarded the result. Click Ask about this page again."
+      "The tab changed or navigated while the page was being read, so I discarded the result. Try again."
     );
   }
 
@@ -999,6 +1153,7 @@ async function runRequest(initialStatus, buildPrompt) {
   setBusy(true);
   replyEl.textContent = "";
   clearSources();
+  clearProposal();
   setStatus(initialStatus);
 
   const timeoutId = setTimeout(() => {
@@ -1059,6 +1214,30 @@ async function runRequest(initialStatus, buildPrompt) {
       const error = new Error('The JSON had no string "response" field.');
       error.kind = "malformed";
       throw error;
+    }
+
+    // "Suggest next action": validate the whole reply in code, then read the live
+    // page again, BEFORE anything is drawn. Stop, a timeout or a newer request can
+    // still win during either step. Nothing is executed.
+    if (built.action) {
+      const { ctx, goal } = built.action;
+      const outcome = await evaluateActionReply(data.response, goal, ctx);
+      if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      if (requestId !== latestRequestId) return;
+      if (actionContext !== ctx) {
+        // A tab or page event cleared this capture while the reply was being checked.
+        setStatus("The tab or page changed while the proposal was being checked, so it was discarded. Capture the page again.", true);
+        return;
+      }
+      let note = renderProposal(outcome, ctx, data.response);
+      const fine = outcome.result.kind === "valid" && outcome.freshness.state === "fresh";
+      if (built.showStats && typeof data.prompt_eval_count === "number") {
+        note += ` Prompt tokens: ${data.prompt_eval_count}.`;
+        if (typeof data.total_duration === "number") note += ` Ollama time: ${(data.total_duration / 1e9).toFixed(1)} s.`;
+        if (data.prompt_eval_count >= CONTEXT_WARN_TOKENS) note += " That is close to a 4096-token context.";
+      }
+      setStatus(note, !fine);
+      return;
     }
 
     // Parse the structured reply before touching the UI, so a Stop, timeout or
@@ -1221,6 +1400,211 @@ async function askAboutPage() {
   });
 }
 
+// ---- Suggest next action: PROPOSALS ONLY ---------------------------------------------
+// Nothing below clicks, types, scrolls or navigates. It reads the page's controls,
+// asks the local model for ONE step, checks the reply in code, checks the live
+// page again, and shows the result in words.
+
+// Read the controls of the tab once. Throws a "capture" error on failure.
+async function readActionTargets(tabId) {
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false }, // main frame only
+      world: "ISOLATED",
+      func: captureActionTargets,
+      args: [TARGET_LIMITS],
+    });
+  } catch (error) {
+    throw classifyScriptingError(String(error && error.message ? error.message : error));
+  }
+  const norm = normalizeTargetCapture(results && results[0] ? results[0].result : null);
+  if (!norm) throw captureError("failed", "The page returned no readable list of controls.");
+  return norm;
+}
+
+async function captureActionContext(goal) {
+  // A short page excerpt for context comes from the normal read-only capture.
+  const { tabId, snapshot } = await captureActivePage();
+  const { tab, urlBefore } = await getReadableTab();
+  if (tab.id !== tabId) {
+    throw captureError("changed", "The active tab changed while the page was being read, so I discarded the result. Try again.");
+  }
+  const norm = await readActionTargets(tab.id);
+
+  let tabAfter = null;
+  try {
+    tabAfter = await getActiveTab();
+  } catch (_) {
+    /* treated as changed below */
+  }
+  const expectedUrl = urlBefore.length > TARGET_LIMITS.urlMax ? urlBefore.slice(0, TARGET_LIMITS.urlMax - 1) + "…" : urlBefore;
+  if (!tabAfter || tabAfter.id !== tab.id || stripUrl(tabAfter.url || "") !== urlBefore || norm.url !== expectedUrl) {
+    throw captureError("changed", "The tab changed or navigated while the page was being read, so I discarded the result. Try again.");
+  }
+
+  const version = `a${++actionCounter}`;
+  const records = buildActionRecords(norm, version);
+  const packed = packTargets(records, ACTION_TARGET_BUDGET_CHARS);
+  return { version, tabId: tab.id, urlStripped: urlBefore, goal, norm, records, packed, snapshot, capturedAt: Date.now() };
+}
+
+// Is the page still the one the proposal was made for? A matching address is NOT
+// enough (a single-page app changes its DOM without changing the address), so the
+// live document is read again and compared: same document, same controls.
+//   { state: "fresh" | "stale" | "unknown", reason, current }
+async function recheckActionTargets(ctx, record) {
+  let tab = null;
+  try {
+    tab = await getActiveTab();
+  } catch (_) {
+    return { state: "unknown", reason: "the active tab could not be checked" };
+  }
+  if (!tab || tab.id !== ctx.tabId) return { state: "stale", reason: "the active tab is not the one that was captured" };
+  if (!tab.url) return { state: "unknown", reason: "Cloudy can no longer read this tab (its access may have ended)" };
+  if (stripUrl(tab.url) !== ctx.urlStripped) return { state: "stale", reason: "the page address changed" };
+
+  let norm;
+  try {
+    norm = await readActionTargets(ctx.tabId);
+  } catch (error) {
+    return { state: "unknown", reason: `the page could not be read again (${error.message})` };
+  }
+  if (norm.documentToken !== ctx.norm.documentToken) {
+    return { state: "stale", reason: "the page was reloaded or replaced (a new document at the same address)" };
+  }
+  // Find the control by what it IS (kind, name, state, place in the page), not by its
+  // number: adding a control earlier in the page shifts every number.
+  const current = record ? norm.targets.find((t) => t.signature === record.signature) || null : null;
+  if (record && !current) {
+    return { state: "stale", reason: "the proposed control changed, moved or is gone (its name, state or place in the page differs)" };
+  }
+  if (norm.fingerprint !== ctx.norm.fingerprint || norm.targets.length !== ctx.norm.targets.length) {
+    return { state: "stale", reason: "other controls on the page changed since the capture (added, removed or changed)" };
+  }
+  return { state: "fresh", reason: "", current, scroll: norm.scroll };
+}
+
+async function evaluateActionReply(text, goal, ctx) {
+  const scroll = ctx.norm.scroll;
+  const result = validateActionReply(text, goal, { version: ctx.version, records: ctx.records, scroll });
+  const freshness = result.kind === "valid" ? await recheckActionTargets(ctx, result.record) : null;
+  return { result, freshness };
+}
+
+function addLine(list, text) {
+  const li = document.createElement("li");
+  li.textContent = text;
+  list.appendChild(li);
+}
+
+// Returns the one-sentence status for the status line.
+function renderProposal(outcome, ctx, rawText) {
+  const { result, freshness } = outcome;
+  proposalSection.hidden = false;
+  proposalSection.classList.remove("rejected");
+  proposalChecks.textContent = "";
+  proposalWarnings.textContent = "";
+  proposalRationale.textContent = "";
+  proposalAction.textContent = "";
+
+  const c = ctx.packed;
+  const n = ctx.norm;
+  const cov = [`Capture ${ctx.version}: ${c.total} controls captured, ${c.shown} shown to the model`];
+  if (c.total > c.shown) cov.push(`${c.total - c.shown} left out for size`);
+  if (n.hiddenOmitted > 0) cov.push(`${n.hiddenOmitted} hidden left out`);
+  if (n.capped) cov.push("scan limit reached");
+  let coverage = cov.join("; ") + ".";
+  const scope = [];
+  if (n.scope.iframes > 0) scope.push(`${n.scope.iframes} iframe(s)`);
+  if (n.scope.openShadowRoots > 0) scope.push(`${n.scope.openShadowRoots} open shadow root(s)`);
+  if (n.scope.canvases > 0) scope.push(`${n.scope.canvases} canvas element(s)`);
+  if (scope.length > 0) coverage += ` Not looked at: ${scope.join(", ")} (their contents are not covered).`;
+  proposalCoverage.textContent = coverage;
+  targetsText.textContent = [`TARGETS (${c.shown} of ${c.total} shown):`, ...c.lines, ...(c.note ? [c.note] : [])].join("\n");
+  targetsDetails.hidden = false;
+
+  const FOOT =
+    "Nothing was clicked, typed, scrolled or opened, and Cloudy cannot do those things yet. " +
+    "A valid format means only that the target exists and fits the action; it does not mean the step is correct for your goal, relevant, or harmless.";
+
+  if (result.kind === "malformed") {
+    proposalSection.classList.add("rejected");
+    proposalBanner.textContent = "Proposal only. The model's reply could not be used as a proposal.";
+    proposalAction.textContent = "No valid proposal.";
+    for (const r of result.reasons.slice(0, 6)) addLine(proposalWarnings, r);
+    proposalNote.textContent = FOOT;
+    rawReplyDetails.hidden = false;
+    rawReplyText.textContent = actClip(rawText, 600);
+    return `Proposal rejected: ${result.reasons[0]}. Nothing was executed.`;
+  }
+
+  rawReplyDetails.hidden = true;
+  proposalBanner.textContent = "Proposal only. Not executed.";
+  proposalAction.textContent = describeProposal(result.proposal, result.record || ctx.records.get(result.proposal.target_id.trim()) || null);
+  proposalRationale.textContent = result.proposal.rationale.trim() === ""
+    ? "Model's reason: none given."
+    : `Model's reason (its own words, not verified): ${result.proposal.rationale}`;
+
+  if (result.kind === "rejected") {
+    proposalSection.classList.add("rejected");
+    proposalBanner.textContent = "Proposal only. Not executed. REJECTED: this is not a valid target/action format.";
+    for (const r of result.reasons.slice(0, 6)) addLine(proposalChecks, r);
+    proposalNote.textContent = FOOT;
+    return `Proposal rejected: ${result.reasons[0]} Nothing was executed.`;
+  }
+
+  // Valid format. The page check decides whether it may be relied on at all.
+  for (const check of result.checks) addLine(proposalChecks, check.text);
+  for (const w of result.warnings) addLine(proposalWarnings, w);
+  const age = Math.max(0, Math.round((Date.now() - ctx.capturedAt) / 1000));
+  if (freshness.state === "fresh") {
+    addLine(proposalChecks, `Page check just now: same document, and the controls are unchanged since the capture ${age} s ago.`);
+    if (result.record && freshness.current && freshness.current.viewport !== result.record.viewport) {
+      addLine(proposalWarnings, `Its position changed since the capture: now ${VIEWPORT_WORDS[freshness.current.viewport].toLowerCase()}.`);
+    }
+    proposalBanner.textContent = "Proposal only. Not executed. Valid target/action format.";
+    proposalNote.textContent = FOOT;
+    return `Done. Proposal: ${describeProposal(result.proposal, result.record)} Valid target/action format; the page check passed just now. Nothing was executed.`;
+  }
+  proposalSection.classList.add("rejected");
+  const why = freshness.state === "stale"
+    ? `the page changed since the capture: ${freshness.reason}`
+    : `the page could not be checked again: ${freshness.reason}`;
+  const whyCap = why.charAt(0).toUpperCase() + why.slice(1);
+  proposalBanner.textContent = "Proposal only. Not executed. Valid format, but freshness could not be established.";
+  addLine(proposalWarnings, `${whyCap}. Capture the page again with "Suggest next action" before relying on this proposal.`);
+  proposalNote.textContent = FOOT;
+  return `The proposal has a valid format, but ${why}. Capture again. Nothing was executed.`;
+}
+
+// Separate mode: never runs for Send or Ask. The goal is what the user typed.
+async function suggestNextAction() {
+  const goal = input.value.trim();
+  if (goal === "") return; // empty input does nothing
+  if (inFlight) return; // same guard as Send and Ask
+
+  if (goal.length > MAX_QUESTION_CHARS) {
+    setStatus(`That goal is ${goal.length} characters; goals are limited to ${MAX_QUESTION_CHARS}. Shorten it and try again.`, true);
+    return;
+  }
+
+  await runRequest("Reading the page's controls...", async () => {
+    clearPageContext(); // never mix an older Q&A capture with this mode
+    actionContext = null;
+    const ctx = await captureActionContext(goal);
+    actionContext = ctx;
+    setStatus("Controls captured. Asking Ollama for one next step... (the first request can take a minute while the model loads)");
+    return {
+      prompt: buildActionPrompt(goal, ctx.norm, ctx.snapshot, ctx.packed),
+      system: ACTION_SYSTEM_PROMPT,
+      format: ACTION_SCHEMA,
+      action: { ctx, goal },
+      showStats: true,
+    };
+  });
+}
+
 function stopRequest() {
   if (activeController && !abortCause) {
     abortCause = "user";
@@ -1245,23 +1629,48 @@ input.addEventListener("keydown", (event) => {
 
 stopButton.addEventListener("click", stopRequest);
 askPageButton.addEventListener("click", askAboutPage);
+suggestButton.addEventListener("click", suggestNextAction);
 
 // Clear the page context when its tab is no longer the target. (These events
 // need no extra permission; they only tell us that something changed.)
 if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
   chrome.tabs.onActivated.addListener(({ tabId }) => {
+    refreshAccessState();
     if (pageContext && tabId !== pageContext.tabId) {
       clearPageContext("You switched tabs, so the earlier capture was cleared.");
     }
+    if (actionContext && tabId !== actionContext.tabId) {
+      invalidateProposal("You switched tabs.");
+    }
   });
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (pageContext && tabId === pageContext.tabId && (changeInfo.status === "loading" || changeInfo.url)) {
+    const navigated = changeInfo.status === "loading" || changeInfo.url;
+    // Ignore title and favicon updates for the access indicator.
+    if (changeInfo.status || changeInfo.url) refreshAccessState();
+    if (pageContext && tabId === pageContext.tabId && navigated) {
       clearPageContext("That tab navigated, so the earlier capture was cleared.");
+    }
+    if (actionContext && tabId === actionContext.tabId && navigated) {
+      invalidateProposal("That tab navigated or reloaded.");
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
     if (pageContext && tabId === pageContext.tabId) {
       clearPageContext("That tab was closed.");
     }
+    if (actionContext && tabId === actionContext.tabId) {
+      invalidateProposal("That tab was closed.");
+    }
+    refreshAccessState();
   });
 }
+
+// Keep the access indicator current. These look only at the tab's URL and the
+// access Chrome has granted; nothing is injected or captured.
+if (typeof chrome !== "undefined" && chrome.permissions) {
+  // The user can change "Site access" while the panel is open.
+  if (chrome.permissions.onAdded) chrome.permissions.onAdded.addListener(() => refreshAccessState());
+  if (chrome.permissions.onRemoved) chrome.permissions.onRemoved.addListener(() => refreshAccessState());
+}
+
+refreshAccessState();

@@ -7,16 +7,22 @@ in `sidepanel.js`) and shows the reply. It has two modes:
 - **Ask about this page**: you click it explicitly. Cloudy takes a fresh, limited, read-only snapshot of the
   active tab, sends it with your question to local Ollama, and shows the answer plus the evidence it cites.
 
+- **Suggest next action**: you type a goal and click it. Cloudy lists the page's controls and asks the local model for
+  ONE next step (click, type, scroll, ask you, or "cannot"). It only **proposes**: nothing is clicked, typed,
+  scrolled or opened, and there is no Execute button.
+
 There is no clicking, typing, scrolling or navigating on websites, no microphone, and no agent loop.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `manifest.json` | Extension declaration (Manifest V3). Permissions: `sidePanel`, `activeTab`, `scripting`, host `http://localhost:11434/*` |
-| `background.js` | Service worker; opens the side panel when you click the toolbar icon (this click also grants `activeTab`) |
+| `manifest.json` | Extension declaration (Manifest V3). Permissions: `sidePanel`, `activeTab`, `scripting`; hosts `http://localhost:11434/*`, `https://*/*`, `http://*/*` |
+| `background.js` | Service worker; opens the side panel when you click the toolbar icon (this click also grants `activeTab`, the fallback when Chrome withholds site access) |
 | `sidepanel.html` / `.css` / `.js` | The UI, the request logic, evidence building, and citation checking |
 | `capture.js` | The read-only function that runs inside the page to choose the content and build the snapshot |
+| `targets.js` | The read-only function that runs inside the page to list its links, buttons and supported form controls (for Suggest next action) |
+| `actions.js` | Pure logic for Suggest next action: control IDs, the bounded list, the prompt, and the strict reply validation (no DOM, no `chrome.*`) |
 | `icons/` | Toolbar and header icons (16, 48, 128 px), made from `Mascot.png` on a black tile |
 | `fonts/` | Bundled Instrument Serif and Inter (SIL OFL), so no network font loading |
 | `Mascot.png` | Original mascot artwork (not loaded by the extension) |
@@ -27,7 +33,8 @@ There is no clicking, typing, scrolling or navigating on websites, no microphone
 2. Turn on **Developer mode** (top right).
 3. Click **Load unpacked** and choose the folder that contains `manifest.json`.
 4. Copy the extension **ID** shown on its card (32 letters).
-5. Click the extension's toolbar icon (puzzle-piece menu, then pin it) to open the panel.
+5. Click the extension's toolbar icon (puzzle-piece menu, then pin it) to open the panel. (Reading normal pages
+   needs no further click; see "How access works" below.)
 
 After editing files, click the reload arrow on the extension's card, then reload the web page you want to test on.
 
@@ -71,9 +78,25 @@ Common messages: `HTTP 403` means the origin is not allowed (check `OLLAMA_ORIGI
 
 ### How access works
 
-`activeTab` gives Cloudy temporary access to **one tab**, only after you invoke the extension on it by
-clicking its **toolbar icon**. Clicking a button inside the side panel does **not** grant access. Access
-lasts while that tab stays on the same site and ends when you navigate to another site or close the tab.
+Cloudy declares host access to ordinary websites (`https://*/*` and `http://*/*`; not `file://`, and not
+`<all_urls>`). With that, it can read the active tab of a normal http/https page **without a toolbar click**.
+Chrome shows this as "Read and change all your data on all websites" when you install or reload the extension.
+Cloudy only reads a page when you click **Ask about this page** or **Suggest next action**; nothing is read
+when you switch tabs.
+
+Chrome still decides what Cloudy may read:
+
+- **Site access.** At `chrome://extensions` > Cloudy > Details you can set "Site access" to "On click" or "On
+  specific sites". Then Chrome withholds access on other pages, and Cloudy says so. Either set it to "On all
+  sites", or click **Cloudy's toolbar icon** on that tab: `activeTab` then gives temporary access to that one
+  tab (until it navigates to another site or closes). Clicking a button inside the side panel does **not** grant
+  access.
+- **Restricted pages.** Chrome never lets extensions read `chrome://` pages, other extensions' pages, the
+  Chrome Web Store, `file://` pages (Cloudy does not ask for them) and similar. Cloudy
+  shows "Page access: unavailable" for these and does nothing.
+- **Access indicator.** The line at the top of "Page context" shows whether the active tab can be read. It looks
+  only at the tab's address and the access Chrome has granted. It injects nothing and captures nothing. When the
+  tab becomes unreadable, an earlier capture or proposal is cleared so it cannot look current.
 
 Cloudy handles the toolbar click itself (`background.js`) instead of using Chrome's
 `openPanelOnActionClick` shortcut, because Chrome intentionally does not grant `activeTab` that way
@@ -208,14 +231,16 @@ model wrote.
 ### Retest after changes
 
 1. Reload Cloudy at `chrome://extensions`, then reload the test page.
-2. Open a public page, click **Cloudy's toolbar icon** on it, ask about its content and click **Ask about
-   this page**.
+2. Open a public http/https page with the panel open (no toolbar click on that page), ask about its content and
+   click **Ask about this page**. The line above the page info should say the page can be read.
 3. Open "Show exactly what was captured". Check the `SELECTION` note (which region, or fallback), that the
    page text is the article or main content, and that menus appear only under NAVIGATION LINKS.
 4. Compare the answer with that text, and check the Sources list matches.
 5. Repeat on a different kind of public page (a link directory, product page or dashboard-like page).
-6. Failure paths: a second tab where you did not click the icon, `chrome://extensions`, switching tabs after a
-   capture (the Page context box clears), and Stop during a request.
+6. Failure paths: `chrome://extensions` and the Chrome Web Store (both should show "Page access: unavailable"
+   and an earlier capture should clear), switching tabs after a capture (the Page context box clears), setting
+   Cloudy's Site access to "On click" (other pages should show the withheld message until you click the icon or
+   allow all sites), and Stop during a request.
 
 ## Tests
 
@@ -228,12 +253,69 @@ node tests/dump-captures.js     # runs the real capture.js in headless Chrome on
 node tests/capture.test.js      # extractor checks (real Chrome, rendered DOM)
 node tests/panel.test.js        # panel logic with a fake chrome API, fetch and DOM
 node tests/pipeline.test.js     # a fake model reply -> parsing -> ID checking -> what is drawn
+node tests/make-action-fixtures.js && node tests/dump-targets.js   # fixtures -> real targets.js in headless Chrome
+node tests/targets.test.js      # what the page-side capture returned (privacy, names, bounds, DOM changes)
+node tests/proposal.test.js     # fake model reply -> validation -> live recheck -> what is displayed
+node tests/action-model.test.js 5   # the local model's DECISIONS (rate per scenario)
+node tests/render-panel.js      # the real panel in headless Chrome at side-panel width (screenshots)
 node tests/model.test.js ref_contents_main 5   # asks the local model; reports a pass rate
 node tests/dump-captures.js <url> <name>       # capture a live page, then: node tests/model.test.js <name> 5
 ```
 
 The capture and panel tests are deterministic. The model test is not: a small local model varies from run to
 run, so it prints how many of N runs passed. None of these run the installed extension.
+## Suggest next action (proposals only)
+
+You type a goal ("search for red running shoes"), then click **Suggest next action**. Cloudy never performs the
+step. It shows it in words so you can judge it.
+
+### What is captured
+
+`targets.js` scans the **whole main frame** (not just the article region, because search boxes and menus usually sit
+outside it) and lists visible links, buttons, checkboxes, radio buttons, disclosures and text fields/areas, each
+with an ID scoped to that capture (`a3:E7`), its kind, name, region (search, navigation, main, banner, footer...),
+disabled/read-only state, and whether it is in view or offscreen. It is a supported subset of accessible-name
+rules (aria-labelledby, aria-label, `<label>`, visible button/link text, image alt, svg title, title attribute,
+and the placeholder as a **flagged weak fallback**), not a full accessibility tree.
+
+- **Never read:** any input, textarea or select value, password value, autofill content or contenteditable text. No
+  field is ever checked for emptiness. A submit button's `value` is not used as its name either, so
+  `<input type="submit" value="Search">` appears unnamed.
+- **Left out:** hidden controls (only counted).
+- **Listed but unsupported for proposals:** password and file fields, select menus, other input types,
+  contenteditable regions, and fields that look like credential or payment fields.
+- **Not covered, and reported:** iframes, shadow roots and canvas are counted, not entered.
+- **Bounded:** at most 150 controls are captured and about 3200 characters are sent to the model; the rest is
+  stated as omitted. The 4000-character Q&A budget is separate and unchanged.
+
+### What the panel checks (format, not wisdom)
+
+The reply must have exactly seven fields and an allowed action (`click`, `type`, `scroll`, `ask_user`,
+`cannot`). Fields the action does not use are ignored and flagged. Then, for click/type: the ID must belong to
+**this** capture and have been **shown to the model**; the control must exist, be enabled and (for typing) not
+read-only; the action must fit the control (no typing into buttons, no clicking text fields); typed text may only
+use words from **your goal** and may not look like a card number or token; credential-looking fields are refused;
+and labels such as buy, pay, delete or send are refused as consequential. A keyword list cannot prove that anything
+else is harmless, so a passing proposal is only called **"valid target/action format"**.
+
+### Freshness
+
+An unchanged address is not proof of an unchanged page. Right before showing a proposal, Cloudy reads the page
+again and compares: same document (a reload gives a new one even at the same address), same tab and address, the
+proposed control still present with the same name, state and place in the page, and the list of controls
+unchanged. Scrolling does not count as a change. If any of that fails, or the page cannot be read again, the
+proposal is shown as **stale / freshness not established** and you are asked to capture again. Switching tabs,
+navigating, reloading or closing the tab clears a displayed proposal. A DOM change that happens *after* a proposal
+is displayed is not noticed until the next capture, so a future Execute step must recheck immediately before acting.
+
+### Limits to keep in mind
+
+- The model's choice can be wrong even when the format is valid: a valid ID does not prove relevance. Compare the
+  step with your goal and the "controls sent to the model" list.
+- Local-model results are a rate, not a guarantee (see Tests).
+- Page text and control names are untrusted data; the instructions tell the model to ignore orders found there,
+  which helps but is not a complete defense. The code checks above are what stop an obeyed order from being shown as valid.
+
 ## Notes
 
 - Stop cancels the browser's request. It does not prove Ollama stopped computing.

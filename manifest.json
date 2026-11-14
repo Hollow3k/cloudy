@@ -5,7 +5,7 @@
   "description": "Chat with a local Ollama model, and ask it about the page you choose, from the Chrome side panel.",
   "minimum_chrome_version": "114",
   "permissions": ["sidePanel", "activeTab", "scripting"],
-  "host_permissions": ["http://localhost:11434/*"],
+  "host_permissions": ["http://localhost:11434/*", "https://*/*", "http://*/*"],
   "background": {
     "service_worker": "background.js"
   },
