@@ -1,18 +1,74 @@
 # Cloudy (v0.1.0)
 
-A Chrome side panel that sends a typed prompt to a local Ollama model (`qwen3:4b-instruct`, set by `MODEL`
-in `sidepanel.js`) and shows the reply. It has two modes:
+**Cloudy is a local, voice-first AI browser agent that turns your intent into completed workflows across the web,
+planning, acting and adapting as it goes.**
 
-- **Send** (or Enter): plain chat. Never touches any web page.
-- **Ask about this page**: you click it explicitly. Cloudy takes a fresh, limited, read-only snapshot of the
-  active tab, sends it with your question to local Ollama, and shows the answer plus the evidence it cites.
+You give it the goal, not a script of clicks. The kind of outcome it is meant to take on:
 
-- **Suggest next action**: you type a goal and click it. Cloudy lists the page's controls and asks the local model for
-  ONE next step (click, type, scroll, ask you, or "cannot"). It **proposes**; nothing happens until you press
-  **Approve** on that one proposal. Approve runs exactly that one action (see "Approving one action").
+- "Find the three best-reviewed noise-cancelling headphones under my budget across a few shops, compare them, and put
+  my pick in the cart." (it stops before paying)
+- "Book the earliest dentist appointment next week that fits my calendar."
+- "Go through my unread email, unsubscribe from the newsletters, and draft replies to the ones that need an answer."
+- "Collect this month's invoices from my vendor portals, download them and give me the totals."
+- "Fill in this multi-page application from my saved details, and stop before submitting."
 
-Cloudy never acts on its own: no automatic chain of steps (after an approved action it captures the page again and
-stops), no microphone, no vision.
+The model runs on your own machine (local Ollama, `qwen3:4b-instruct`, set by `MODEL` in `sidepanel.js`).
+
+## The product it is meant to become
+
+- **Intent in, workflow out.** You type (eventually speak) a goal. Cloudy understands the active page, proposes how it
+  would pursue the goal, and starts after your approval.
+- **Observe, choose one action, validate, act, observe again.** The next step depends on what actually changed on the
+  page, not on a fixed sequence guessed up front. Every action is validated against the live page right before it runs.
+- **You stay in control of consequences.** Routine steps inside the approved goal run without repeated approvals.
+  Buying, sending, deleting and other consequential steps pause for a specific confirmation. "Type this" only types;
+  "search for this" follows through to the search results.
+- **Tab-aware.** While the panel is open, switching tabs refreshes its page context. Switching away during a run stops
+  that run, so it never keeps acting on the wrong tab.
+- **Reads ordinary pages, not secrets.** It can read page content and ordinary form values, and excludes passwords,
+  payment credentials and authentication codes.
+- **Local model, honest scope.** The model runs locally and a short task memory records what it tried so it does not
+  repeat itself, then clears automatically. The websites still receive the searches, clicks and submissions you
+  authorize: local processing does not make those interactions offline.
+- **No arbitrary step cap.** It continues while making progress, stops when you press Stop, and pauses or reports
+  clearly when it is stuck, needs clarification or cannot support an action. It calls a task complete only with
+  observed evidence, not because the model said "done".
+- **Voice comes after the text-and-action foundation works.** Dense pages, inaccessible controls and unusual sites
+  will still need handling. "Works on every site" is not the claim.
+
+In one line: you give Cloudy the intent; it handles the browser steps, with you in control of the consequences.
+
+## Where it is now
+
+An early prototype. Built and covered by fixture and headless-Chrome tests (scripted model replies, plus live runs
+against the local model on local test pages); not yet exercised on many real sites, and only partly hand-tested in the
+installed extension.
+
+- **Chat** (**Send**): plain chat with the local model. Never touches a web page.
+- **Ask about this page**: a fresh, limited, read-only snapshot goes to Ollama; the answer comes back with the
+  evidence it cites.
+- **Suggest next action**: lists the page's controls (with ordinary field values and checkbox state, never secrets)
+  and the model proposes ONE step: click, type, search, scroll, ask you, or "cannot". Nothing happens until you press
+  **Approve**. A search (fill plus submit) is one approval; "type" only fills.
+- **Start task** (the agent loop): one Start approval for a goal, then read the page, take one step, read it again,
+  choose the next, with no further approval for routine steps. Search runs as ordinary steps (type, then submit
+  chosen from the updated page). It pauses for a separate confirmation on consequential-looking controls, waits for
+  your typed answer (Continue) when the model needs one, and stops when the model cannot continue, after repeated
+  rounds with no progress, after repeated rounds where no step could be run, when the tab changes, or on
+  Stop. Stop cannot undo a step already taken, and says so. A short in-memory record of steps avoids repeats and is
+  dropped when the task ends. Success is reported only with evidence Cloudy observed itself (a typed value read back,
+  the page changed, search results showing the query); otherwise it says "stopped / unverified".
+- **Live context**: while the panel is open it captures the active page after tab switches and navigation (capture
+  only: no model call, no action).
+- **Guard rails**: secrets are never read or typed; disabled, read-only and stale targets are refused and re-checked
+  right before every action; only the main page is touched; ordinary http/https pages only.
+
+## Not built yet
+
+- Voice input and spoken goals.
+- A plan shown for approval before the run starts (today Start approves the goal; the next step is chosen live).
+- Multi-tab workflows and recovery when a page misbehaves; vision for pages where text alone is not enough.
+- Handling for dense pages, iframes, shadow DOM, nested scrollers and inaccessible controls.
 
 ## Files
 
@@ -364,6 +420,59 @@ unchanged. Scrolling does not count as a change. If any of that fails, or the pa
 proposal is shown as **stale / freshness not established** and you are asked to capture again. Switching tabs,
 navigating, reloading or closing the tab clears a displayed proposal. A DOM change that happens *after* a proposal
 is displayed is not noticed until the next capture, which is why Approve checks the page again right before acting.
+
+### Task: one Start approval, then a loop of ordinary steps
+
+**Start task** is the one approval for the goal you typed. Each round then reuses the pieces above: a fresh capture of
+the active page, one model call that proposes ONE step, the same live-page validation and guards (secret, disabled,
+read-only and stale-target checks, the key/signature/document re-check right before acting), the same executor, and a
+fresh capture afterwards. Routine steps are not approved again. A consequential-looking control still **pauses the task**
+for its separate explicit confirmation (Confirm continues, Cancel ends the task).
+
+- **Search uses ordinary steps:** type the query, then the model chooses the submission from the *updated* page (click
+  the search button, or, with no button and the query already in the field, the existing `search` step, which then only
+  submits). A task adds no search sequence of its own, and the single-step `search` proposal still works.
+- **Type-only goals** ("type X into the search box") end as soon as the text is read back from the field and matches.
+- **Memory:** a short in-memory record of this task's steps and what happened. It is shown to the model (last 6) and used
+  to avoid repeats, and is dropped when the task ends.
+- **A question waits for you.** When the model needs information it cannot get from the page (`ask_user`), the task
+  pauses (same goal, same step record, same tab and document) and the Task box shows the question with an answer field
+  and **Continue**. Your answer is added as user context and the SAME task resumes from a fresh capture. Before it
+  continues, Cloudy checks that the tab, address and document are still the ones it paused on; if not, it stops and
+  does nothing on the other page. **Stop** works while waiting, and so does switching or closing the tab. Questions
+  that only ask permission for something the goal already covers ("May I use the search field?") or which field or
+  button to use are sent back to the model (at most 2 times) instead of reaching you.
+- **Two different failure budgets.** *No progress*: a step WAS dispatched and changed nothing (or repeated such a step,
+  or returned to a page state already seen); 2 in a row stop the task. *Nothing dispatched*: the reply was malformed or
+  rejected, the target was stale or not offered, or the executor refused; this is a different count (3 in a row), the
+  cause is kept, shown in the step list and fed back to the model so it can choose another step, and the final message
+  lists the causes. A rejection therefore never uses up the no-progress budget.
+- **It also stops** when the model cannot continue, when the tab changes, or on **Stop**. There is no fixed cap on the
+  number of steps. Stop cancels a request or an undispatched step and ignores any late reply; it cannot undo a step
+  that was already dispatched.
+- **Pages that keep changing.** Inside a task the freshness check compares the SAME element (identity key) and what it
+  is (kind, name, disabled, read-only, submit), and ignores unrelated changes elsewhere (lazy-loaded lists, ads). A
+  renamed, disabled or removed target is still refused, and outside a task the strict whole-page check still applies.
+  When a step is not run, the real cause is shown. After a step the page is re-read until it is quiet (up to 3 re-reads,
+  350 ms apart) before the next round. (The cause of the first-video-click failure on YouTube is inferred from this
+  behaviour, not reproduced on the real site.)
+- **Step list wording** says what happened to each step: `executed`, `rejected, not run`, `not run`, `not asked`,
+  `you were asked`, `stopped` or `not confirmed`. Routine task steps run without Approve; the status line says so.
+- **Long reasons.** A model reason, rationale or question over 300 characters is shortened for display and flagged
+  instead of rejecting a valid step (line breaks become spaces); over 2000 characters is still rejected. The target ID
+  and typed text keep their strict limits.
+- **Search without a form.** Typing never waits for a submit path. A field marked "typing allowed; submit path not
+  established yet" can still be typed into; the submit control is then chosen from the NEXT capture, including a
+  control that becomes enabled after typing. For a field with no form and no search landmark, a unique rendered,
+  enabled control labelled as search in a small local container (up to 4 levels) is accepted; several candidates, a
+  disabled one or an unlabelled icon are not guessed, and Enter is never pressed.
+- **Crowded pages.** When controls do not fit the size budget, main-content, dialog, search and form controls are kept
+  ahead of navigation, banner, sidebar and footer controls (IDs and the omitted-count note are unchanged). A link or
+  button may carry a short `same card:` text from its own card (for example the channel name next to a video title); an
+  area holding more than 8 links or buttons is never merged.
+- **Success** is reported only with evidence Cloudy observed itself: the model's `done` is believed only if a step's
+  effect was observed (a typed value read back, a changed page, and for searches the query's results on the new page).
+  Otherwise it says *Stopped, unverified*.
 
 ### Approving one operation
 

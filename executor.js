@@ -74,7 +74,12 @@ function performApprovedAction(spec) {
   if (!el || !el.isConnected) return fail("missing", "The control is no longer on the page.");
   const cur = world.describe(el);
   if (cur === null) return fail("hidden", "The control is hidden or no longer a listed control.");
-  if (cur.signature !== spec.signature || cur.kind !== spec.kind) {
+  // The same element (by its key) AND the same control. A task on a page that keeps changing around the control
+  // (lazy-loaded lists, ads) compares what the control IS (kind, name, state), not its exact place in the DOM.
+  const sameTarget = (c) => spec.loose === true
+    ? c.kind === spec.kind && c.name === spec.name && c.disabled === spec.disabled && c.readOnly === spec.readOnly && c.submit === spec.isSubmit
+    : c.signature === spec.signature && c.kind === spec.kind;
+  if (!sameTarget(cur)) {
     return fail("changed", "The control changed (its name, state or place in the page differs from the one you approved).");
   }
   if (cur.disabled) return fail("disabled", "The control is disabled.");
@@ -167,7 +172,7 @@ function performApprovedAction(spec) {
     }
     // The page may have reacted to the typing: look again before submitting.
     const now = world.describe(el);
-    if (now === null || now.signature !== spec.signature || !samePath(now.search)) {
+    if (now === null || !sameTarget(now) || !samePath(now.search)) {
       return { ok: false, partial: true, code: "changed-after-fill", steps: [...steps, { step: "submit", done: false }],
         reason: "The page changed after the field was filled (the search box or its submit path differs), so the search was not submitted." };
     }

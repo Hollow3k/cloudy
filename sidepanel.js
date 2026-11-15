@@ -97,6 +97,15 @@ const confirmUnknown = document.getElementById("confirm-unknown");
 const confirmButton = document.getElementById("confirm-button");
 const cancelConfirmButton = document.getElementById("cancel-confirm-button");
 const liveCaptureEl = document.getElementById("live-capture");
+const startButton = document.getElementById("start-button");
+const taskSection = document.getElementById("task-section");
+const taskGoal = document.getElementById("task-goal");
+const taskSteps = document.getElementById("task-steps");
+const taskResult = document.getElementById("task-result");
+const taskAnswerBox = document.getElementById("task-answer-box");
+const taskQuestion = document.getElementById("task-question");
+const taskAnswer = document.getElementById("task-answer");
+const taskContinue = document.getElementById("task-continue");
 const executionSection = document.getElementById("execution-section");
 const executionAction = document.getElementById("execution-action");
 const executionStatus = document.getElementById("execution-status");
@@ -172,17 +181,19 @@ function setStatus(message, isError = false) {
 
 function setBusy(busy) {
   inFlight = busy;
-  sendButton.disabled = busy;
-  askPageButton.disabled = busy;
-  suggestButton.disabled = busy;
+  const locked = busy || !!activeTask; // a running task keeps every other button off, even between its steps
+  sendButton.disabled = locked;
+  askPageButton.disabled = locked;
+  suggestButton.disabled = locked;
+  startButton.disabled = locked;
   approveButton.disabled = busy || pendingApproval === null; // never enabled without an approval
   confirmButton.disabled = busy || pendingApproval === null;
-  if (!busy && autoPending) {
+  if (!busy && !activeTask && autoPending) {
     autoPending = false;
     scheduleAutoCapture();
   }
-  stopButton.disabled = !busy;
-  input.readOnly = busy; // still focusable, but can't be edited mid-request
+  stopButton.disabled = !locked;
+  input.readOnly = locked; // still focusable, but can't be edited mid-request
 }
 
 // ---- Page context display ---------------------------------------------------
@@ -216,6 +227,7 @@ function clearPageContext(reason) {
 // Any change that makes a displayed proposal no longer the one that was approved
 // (a new request, a tab or page change, a stale page) ends its approval.
 function dropApproval() {
+  if (activeTask) resolveTaskConfirm(activeTask, "dropped"); // a task waiting for a confirmation is released
   pendingApproval = null;
   approveButton.hidden = true;
   approveButton.disabled = true;
@@ -1297,9 +1309,11 @@ async function runRequest(initialStatus, buildPrompt) {
       if (actionContext !== ctx) {
         // A tab or page event cleared this capture while the reply was being checked.
         setStatus("The tab or page changed while the proposal was being checked, so it was discarded. Capture the page again.", true);
+        lastActionOutcome = { discarded: true, ctx };
         return;
       }
       let note = renderProposal(outcome, ctx, data.response);
+      lastActionOutcome = { ctx, result: outcome.result, freshness: outcome.freshness };
       const fine = outcome.result.kind === "valid" && outcome.freshness.state === "fresh";
       if (built.showStats && typeof data.prompt_eval_count === "number") {
         note += ` Prompt tokens: ${data.prompt_eval_count}.`;
@@ -1416,7 +1430,7 @@ async function runRequest(initialStatus, buildPrompt) {
 async function submitPrompt() {
   const prompt = input.value.trim();
   if (prompt === "") return; // empty input does nothing
-  if (inFlight) return; // blocks button clicks AND Enter
+  if (inFlight || activeTask) return; // blocks button clicks AND Enter
 
   await runRequest(
     "Working... (the first request can take a minute while the model loads)",
@@ -1428,7 +1442,7 @@ async function submitPrompt() {
 async function askAboutPage() {
   const question = input.value.trim();
   if (question === "") return; // empty input does nothing
-  if (inFlight) return; // same guard as Send
+  if (inFlight || activeTask) return; // same guard as Send
 
   if (question.length > MAX_QUESTION_CHARS) {
     setStatus(
@@ -1516,13 +1530,16 @@ async function captureActionContext(goal) {
   const version = `a${++actionCounter}`;
   const records = buildActionRecords(norm, version);
   const packed = packTargets(records, ACTION_TARGET_BUDGET_CHARS);
-  return { version, tabId: tab.id, urlStripped: urlBefore, goal, norm, records, packed, snapshot, capturedAt: Date.now() };
+  return { version, tabId: tab.id, urlStripped: urlBefore, goal, norm, records, packed, snapshot, capturedAt: Date.now(), loose: !!activeTask };
 }
 
 // Is the page still the one the proposal was made for? A matching address is NOT
 // enough (a single-page app changes its DOM without changing the address), so the
 // live document is read again and compared: same document, same controls.
 //   { state: "fresh" | "stale" | "unknown", reason, current }
+// What a control IS (kind, name, state), without its exact place in the DOM.
+const sameControl = (t, r) => t.kind === r.kind && t.name === r.name && t.disabled === r.disabled && t.readOnly === r.readOnly && t.submit === r.submit;
+
 async function recheckActionTargets(ctx, record) {
   let tab = null;
   try {
@@ -1545,11 +1562,18 @@ async function recheckActionTargets(ctx, record) {
   }
   // Find the control by what it IS (kind, name, state, place in the page), not by its
   // number: adding a control earlier in the page shifts every number.
-  const current = record ? norm.targets.find((t) => t.signature === record.signature) || null : null;
+  // Inside a task (ctx.loose) the SAME element (its identity key) that is still the same control is enough: pages
+  // such as a video site keep loading and reordering other things while the model thinks, which must not make an
+  // unchanged target stale. Outside a task the exact signature and the whole control list must match.
+  const current = record
+    ? (ctx.loose
+      ? norm.targets.find((t) => t.key === record.key && t.key > 0 && sameControl(t, record)) || null
+      : norm.targets.find((t) => t.signature === record.signature) || null)
+    : null;
   if (record && !current) {
     return { state: "stale", reason: "the proposed control changed, moved or is gone (its name, state or place in the page differs)" };
   }
-  if (norm.fingerprint !== ctx.norm.fingerprint || norm.targets.length !== ctx.norm.targets.length) {
+  if (!ctx.loose && (norm.fingerprint !== ctx.norm.fingerprint || norm.targets.length !== ctx.norm.targets.length)) {
     return { state: "stale", reason: "other controls on the page changed since the capture (added, removed or changed)" };
   }
   return { state: "fresh", reason: "", current, scroll: norm.scroll, viewport: norm.viewport };
@@ -1568,8 +1592,32 @@ function addLine(list, text) {
   list.appendChild(li);
 }
 
-// Returns the one-sentence status for the status line.
+const TASK_FOOT =
+  "Task mode: Start already approved routine steps for this goal, so a step that passes the checks runs by itself; " +
+  "a consequential-looking control pauses for your confirmation. Steps already executed are listed in the Task box. " +
+  "A valid format means only that the target exists and fits the action; it does not mean the step is correct for your goal, relevant, or harmless.";
+
+// Inside a task the same proposal is drawn, but it is worded for what is really happening: nothing here asks for
+// Approve, and steps may already have been executed.
 function renderProposal(outcome, ctx, rawText) {
+  const note = renderProposalCore(outcome, ctx, rawText);
+  if (!activeTask) return note;
+  proposalBanner.textContent = proposalBanner.textContent
+    .replace("Proposal only. The model's reply could not be used as a proposal.", "Task step: the model's reply could not be used (not run).")
+    .replace("Proposal only. Not executed. REJECTED:", "Task step REJECTED (not run):")
+    .replace("Proposal only. Not executed. Valid format, but freshness could not be established.", "Task step NOT run: valid format, but freshness could not be established.")
+    .replace("Proposal only. Not executed.", "Task step, not run yet (it runs by itself if the checks pass).");
+  proposalNote.textContent = TASK_FOOT;
+  return note
+    .replace(/^Done\. Proposal: /, "Task step: ")
+    .replace(/^Proposal rejected: /, "Task step rejected (not run): ")
+    .replace(" Nothing has been executed; press Approve to run this one step.", " It runs next without another approval if the checks pass.")
+    .replace(" Nothing was executed.", " Not run.")
+    .replace(/^The proposal has a valid format, but /, "Task step not run: valid format, but ");
+}
+
+// Returns the one-sentence status for the status line.
+function renderProposalCore(outcome, ctx, rawText) {
   const { result, freshness } = outcome;
   proposalSection.hidden = false;
   proposalSection.classList.remove("rejected");
@@ -1696,6 +1744,10 @@ function offerApproval(result, ctx) {
     key: rec ? rec.key : 0,
     signature: rec ? rec.signature : "",
     kind: rec ? rec.kind : "",
+    name: rec ? rec.name : "",
+    disabled: rec ? rec.disabled : false,
+    readOnly: rec ? rec.readOnly : false,
+    loose: !!ctx.loose, // a task step: compare what the control IS, and ignore unrelated page changes
     // the relevant initial state of a search (the field's content and how it is submitted)
     initialValue: isSearch ? rec.value : null,
     initialValueLen: isSearch ? rec.valueLen : 0,
@@ -1736,7 +1788,8 @@ function offerApproval(result, ctx) {
     approvalNote.textContent += " This step needs a separate explicit confirmation after you press the button.";
     approveButton.textContent = "Review and confirm...";
   }
-  approveButton.hidden = false;
+  if (activeTask) approvalNote.textContent = ""; // a task runs its own routine steps; nothing here asks for Approve
+  approveButton.hidden = !!activeTask;
   approveButton.disabled = inFlight;
 }
 
@@ -1812,9 +1865,10 @@ async function prepareApprovedAction(a, exec) {
   if (a.action !== "scroll") {
     current = norm.targets.find((t) => t.key === a.key) || null;
     if (!current) return refusal("Not done: the control is missing or hidden now.", "It is no longer on the page as a visible control. Nothing else was chosen in its place.");
-    if (current.signature !== a.signature) return refusal("Not done: the control changed.", "Its name, state or place in the page differs from the one you approved. Nothing else was chosen in its place.");
+    const unchanged = a.loose ? sameControl(current, a) : current.signature === a.signature;
+    if (!unchanged) return refusal("Not done: the control changed.", "Its name, state or place in the page differs from the one you approved. Nothing else was chosen in its place.");
   }
-  if (norm.fingerprint !== a.fingerprint || norm.targets.length !== a.controlCount) {
+  if (!a.loose && (norm.fingerprint !== a.fingerprint || norm.targets.length !== a.controlCount)) {
     return refusal("Not done: the page changed since the proposal.", "Other controls were added, removed or changed. Make a new proposal.");
   }
   if (a.action === "search") {
@@ -1828,7 +1882,7 @@ async function prepareApprovedAction(a, exec) {
   // The same rules as for the proposal, applied to the control as it is NOW.
   const version = `a${++actionCounter}`;
   const records = buildActionRecords(norm, version);
-  packTargets(records, ACTION_TARGET_BUDGET_CHARS);
+  packTargets(records, Infinity); // policy check of the control as it is now; "was it shown to the model" was settled at proposal time
   const reply = JSON.stringify({ ...a.proposal, target_id: current ? `${version}:E${current.n}` : "" });
   const check = validateActionReply(reply, a.goal, { version, records, scroll: norm.scroll, viewport: norm.viewport });
   if (check.kind !== "valid") {
@@ -1845,7 +1899,7 @@ async function prepareApprovedAction(a, exec) {
     if (!plan.ok) return refusal("Not done: this scroll is not possible.", `${plan.reason.charAt(0).toUpperCase()}${plan.reason.slice(1)}.`);
     step = plan.step;
   }
-  const spec = { action: a.action, token: a.documentToken, key: a.key, signature: a.signature, kind: a.kind, text: a.text, direction: a.direction, step };
+  const spec = { action: a.action, token: a.documentToken, key: a.key, signature: a.signature, kind: a.kind, loose: a.loose, name: a.name, disabled: a.disabled, readOnly: a.readOnly, isSubmit: a.submit, text: a.text, direction: a.direction, step };
   if (a.action === "search") {
     spec.initialValue = a.initialValue;
     spec.submit = {
@@ -1929,13 +1983,25 @@ function describeDispatchResult(a, r, after) {
   };
 }
 
+// Read the page; if it is still changing (a results page filling in), read again, at most QUIET_POLLS times in
+// total, and use the last read. Bounded, so a page that never settles cannot hold the task up.
+const QUIET_POLLS = 3;
+const QUIET_MS = 350;
 async function captureAfter() {
-  const { tab } = await getReadableTab();
-  const norm = await readActionTargets(tab.id);
+  let last = null;
+  for (let i = 0; i < QUIET_POLLS; i++) {
+    const { tab } = await getReadableTab();
+    const norm = await readActionTargets(tab.id);
+    const read = { norm, url: stripUrl(tab.url), rawUrl: tab.url };
+    const settled = last && last.norm.documentToken === norm.documentToken && last.norm.fingerprint === norm.fingerprint && last.url === read.url;
+    last = read;
+    if (settled) break;
+    if (i < QUIET_POLLS - 1) await new Promise((resolve) => setTimeout(resolve, QUIET_MS));
+  }
   const version = `a${++actionCounter}`;
-  const records = buildActionRecords(norm, version);
+  const records = buildActionRecords(last.norm, version);
   const packed = packTargets(records, ACTION_TARGET_BUDGET_CHARS);
-  return { norm, version, packed, url: stripUrl(tab.url), rawUrl: tab.url };
+  return { norm: last.norm, version, packed, url: last.url, rawUrl: last.rawUrl };
 }
 
 // After a dispatch (or a partly executed operation): capture again unless Stop was pressed. Never asks the model.
@@ -2007,7 +2073,7 @@ async function runApproved(a, exec) {
 
 function showExecutionResult(a, result) {
   executionSection.hidden = false;
-  executionAction.textContent = `Approved ${a.action === "search" ? "operation" : "step"}: ${a.description}`;
+  executionAction.textContent = `${activeTask ? "Task step (executed)" : a.action === "search" ? "Approved operation" : "Approved step"}: ${a.description}`;
   executionEffect.textContent = "";
   executionPage.textContent = "";
   afterDetails.hidden = true;
@@ -2051,9 +2117,9 @@ async function startApproved(approval) {
   const exec = { approval, cancelled: false, cancelReason: "", dispatching: false };
   activeExecution = exec;
   setBusy(true);
-  proposalBanner.textContent = "This proposal was approved. It cannot be approved again.";
+  proposalBanner.textContent = activeTask ? "This task step is being run (routine steps were approved by Start)." : "This proposal was approved. It cannot be approved again.";
   approvalNote.textContent = "";
-  proposalNote.textContent = "It was used once. What happened is shown under \"Approved action\" below.";
+  proposalNote.textContent = activeTask ? "Run by the task. What happened is shown below and in the Task box." : "It was used once. What happened is shown under \"Approved action\" below.";
   proposalSection.classList.add("rejected");
   setStatus("Approved. Checking the page and the control again before acting...");
 
@@ -2070,16 +2136,17 @@ async function startApproved(approval) {
   if (result.state === "dispatched") {
     setStatus(approval.action === "search"
       ? `${result.resultsObserved ? "Search submitted." : "Search submit requested."} ${result.effect} Goal not verified.`
-      : `Action dispatched. ${result.effect} Goal not verified.`);
+      : `${activeTask ? "Step executed." : "Action dispatched."} ${result.effect} Goal not verified.`);
   } else if (result.state === "partial") setStatus(`${result.headline} ${result.why}`, true);
   else if (result.state === "unconfirmed") setStatus(`${result.headline} ${result.why}`, true);
   else setStatus(`${result.headline} ${result.why || ""}`.trim(), true);
+  return result;
 }
 
 // The Approve button. A consequential-looking step shows its confirmation first and runs nothing.
 async function approveProposal() {
   const approval = pendingApproval;
-  if (!approval || approval.consumed || inFlight || activeExecution) return;
+  if (!approval || approval.consumed || inFlight || activeExecution || activeTask) return;
   if (approval.confirm && !approval.confirmed) {
     showConfirmation(approval);
     return;
@@ -2092,10 +2159,18 @@ async function confirmProposal() {
   const approval = pendingApproval;
   if (!approval || approval.consumed || inFlight || activeExecution || !approval.confirm || confirmBox.hidden) return;
   approval.confirmed = true;
+  if (activeTask) {
+    resolveTaskConfirm(activeTask, "confirmed"); // the task loop runs it
+    return;
+  }
   await startApproved(approval);
 }
 
 function cancelConfirmation() {
+  if (activeTask && resolveTaskConfirm(activeTask, "cancelled")) {
+    hideConfirmation();
+    return;
+  }
   hideConfirmation();
   if (pendingApproval && !pendingApproval.consumed) {
     approveButton.hidden = false;
@@ -2103,17 +2178,356 @@ function cancelConfirmation() {
   }
 }
 
+// ---- Task: ONE Start approval, then a loop of ordinary steps -------------------------------------
+// Start is the only approval. Each round reuses what already exists: a fresh capture, one model call
+// that proposes ONE step, the same live-page validation, the same approved-step executor and a fresh
+// capture afterwards. Routine steps are not approved again; a consequential-looking control still
+// pauses for its explicit confirmation. The only memory is a short in-memory record of THIS task's
+// steps and the person's answers (used to avoid repeats and shown to the model); it is dropped when the
+// task ends. There is no fixed cap on the number of steps.
+//
+// Two different budgets, because they are different things:
+//  - NO PROGRESS: a step WAS dispatched and changed nothing (or the model repeated such a step).
+//  - RECOVERY: nothing was dispatched (the proposal was rejected, the page was stale, the executor refused).
+//    The cause is kept and fed back to the model so it can choose a different step; after RECOVERY_LIMIT in a
+//    row the task stops and says what the problems were.
+// When the model needs the person (ask_user) the task WAITS for an answer typed in the Task box (same
+// goal, history and tab/document), then continues from a fresh capture. Stop, a tab switch or a closed tab
+// ends it, also while waiting. Success is reported only with something Cloudy observed itself.
+const NO_PROGRESS_LIMIT = 2; // dispatched rounds in a row that changed nothing before the task stops
+const RECOVERY_LIMIT = 3; // rounds in a row with nothing dispatched before the task stops
+const PERMISSION_BOUNCE_LIMIT = 2; // permission-style questions sent back to the model before the person is asked anyway
+const HISTORY_SHOWN = 6; // earlier steps shown to the model (older ones still count against repeats)
+const ANSWERS_SHOWN = 5; // the person's most recent answers shown to the model
+let activeTask = null; // { goal, tabId, cancelled, steps, answers, sigs, noChange, noProgress, recoveries, evidence, ... }
+let lastActionOutcome = null; // set by runRequest for the task loop to read
+
+// What the page looks like for the purpose of "did anything change": document, address, scroll, the
+// control list and the state of the ordinary fields.
+function progressSig(norm) {
+  const t = norm.targets.map((x) => `${x.key}=${x.value === null ? "" : x.value}/${x.checked === null ? "" : x.checked}/${x.selected ? x.selected.join(",") : ""}`).join(";");
+  return `${norm.documentToken}|${norm.url}|${norm.scroll.top}|${norm.fingerprint}|${t}`;
+}
+
+function resolveTaskConfirm(task, decision) {
+  if (!task || !task.confirmWait) return false;
+  const resolve = task.confirmWait;
+  task.confirmWait = null;
+  resolve(decision);
+  return true;
+}
+
+function resolveTaskAnswer(task, answer) {
+  if (!task || !task.answerWait) return false;
+  const resolve = task.answerWait;
+  task.answerWait = null;
+  taskAnswerBox.hidden = true;
+  resolve(answer);
+  return true;
+}
+
+// Stop, a tab switch or a closed tab. Nothing further is dispatched; a dispatched step is not undone.
+function cancelTask(reason) {
+  const task = activeTask;
+  if (!task || task.cancelled) return;
+  task.cancelled = true;
+  task.cancelReason = reason;
+  resolveTaskConfirm(task, "cancelled");
+  resolveTaskAnswer(task, null); // also ends a wait for the person's answer
+  setStatus(`Stopping the task (${reason}). Nothing further will be dispatched; steps already dispatched are not undone.`, true);
+}
+
+// What the task is doing right now: running, paused for the person, or (set at the end) how it ended.
+function setTaskState(task, text) {
+  if (activeTask === task) taskResult.textContent = text;
+}
+
+// A step line says what KIND of thing happened: executed, rejected (never run), not run, or an exchange with the person.
+function recordTaskStep(task, kind, text) {
+  const step = { n: task.steps.length + 1, text: actClip(`${kind}: ${text}`, 240) };
+  task.steps.push(step);
+  addLine(taskSteps, `${step.n}. ${step.text}`);
+}
+
+const taskHistory = (task) => task.steps.slice(-HISTORY_SHOWN).map((s) => `${s.n}. ${s.text}`);
+const taskAnswers = (task) => task.answers.slice(-ANSWERS_SHOWN).map((x) => `You asked: ${x.q} | The user answered: ${x.a}`);
+const stepWords = (approval) => approval.description.replace(/\s*\[a\d+:E\d+\]/g, "");
+
+// Did the field end up holding exactly the typed text, as the NEW capture shows? (An ordinary field only.)
+function fieldHolds(a, after) {
+  if (!after || after.norm.documentToken !== a.documentToken) return false;
+  const t = after.norm.targets.find((x) => x.key === a.key);
+  return !!t && t.value !== null && !t.valueWithheld && t.value === a.text && t.valueLen === a.text.length;
+}
+
+// What this step observably achieved, as words ("" if nothing). Also remembers whether results were seen.
+function stepEvidence(task, a, res, progress) {
+  if (a.action === "type" || a.action === "search") task.lastText = a.text;
+  if (a.action === "type" && fieldHolds(a, res.after)) return `the field holds exactly ${JSON.stringify(a.text)} (read back from the new capture)`;
+  const seen = task.lastText ? observeSearchResults({ text: task.lastText, documentToken: a.documentToken, urlStripped: a.urlStripped }, res.after) : null;
+  if (seen && seen.observed) {
+    task.resultsObserved = true;
+    return seen.text;
+  }
+  if (res.state === "dispatched" && progress) return a.action === "scroll" ? "the page scrolled" : "the page changed after the step";
+  return "";
+}
+
+// The model says the goal is reached. That is believed only with evidence Cloudy observed itself.
+function claimEnd(task, p) {
+  const claim = JSON.stringify(actClip(p.reason, 200));
+  const searching = goalAsksToSearch(task.goal);
+  if (searching ? task.resultsObserved : task.evidence.length > 0) {
+    return { ok: true, text: `Finished. The model reports the goal reached: ${claim}. Cloudy observed: ${task.evidence.slice(-2).join("; ")}.` };
+  }
+  return { ok: false, text: `Stopped, unverified: the model says the goal is reached (${claim}), but Cloudy observed no evidence of it${searching ? " (no search results were observed)" : ""}.` };
+}
+
+// While the task waits, the person answers in the Task box. Returns the answer, or null when the task was stopped.
+function waitForAnswer(task, question) {
+  taskQuestion.textContent = question;
+  taskAnswer.value = "";
+  taskAnswerBox.hidden = false;
+  taskAnswer.focus();
+  setTaskState(task, "Waiting for your answer. The task is paused (same goal, same page); Stop ends it.");
+  setStatus("Task paused: the model needs an answer from you (see the Task box).", true);
+  return new Promise((resolve) => {
+    task.answerWait = resolve;
+  });
+}
+
+// The Continue button of the Task box.
+function submitTaskAnswer() {
+  const task = activeTask;
+  if (!task || !task.answerWait) return;
+  const answer = taskAnswer.value.replace(/\s+/g, " ").trim();
+  if (answer === "") {
+    setStatus("Type your answer first, then press Continue.", true);
+    return;
+  }
+  resolveTaskAnswer(task, actClip(answer, 300));
+}
+
+// Before continuing after a wait: still the task's tab, address and document? "" if so, else why not.
+async function checkSamePageAfterWait(task) {
+  let tab = null;
+  try {
+    tab = await getActiveTab();
+  } catch (_) {
+    tab = null;
+  }
+  if (!tab || tab.id !== task.tabId) return "the active tab is not the task's tab any more";
+  if (!tab.url || stripUrl(tab.url) !== task.waitDoc.url) return "the page address changed while the task was waiting";
+  let norm;
+  try {
+    norm = await readActionTargets(task.tabId);
+  } catch (error) {
+    return `the page could not be read again (${error.message})`;
+  }
+  if (norm.documentToken !== task.waitDoc.documentToken) return "the page was reloaded or replaced while the task was waiting";
+  return "";
+}
+
+async function runTaskLoop(task) {
+  const stop = (why) => ({ ok: false, text: `Stopped: ${why}` });
+  const cancelled = () => ({ ok: false, text: `Stopped: ${task.cancelReason || "you pressed Stop"}. Nothing further was dispatched; steps already dispatched are not undone.` });
+  const noProgressEnd = () => stop(`no progress in ${NO_PROGRESS_LIMIT} rounds in a row (steps were dispatched but nothing observable changed). Nothing more was dispatched.`);
+  const recoveryEnd = () => stop(`could not find a valid, safe next step after ${RECOVERY_LIMIT} attempts in a row; nothing was dispatched for them. The problems were: ${task.problems.slice(-RECOVERY_LIMIT).map((x) => actClip(x, 150)).join(" | ")}`);
+  // A round where NOTHING was dispatched: keep the cause (the model sees it next round), and give up after RECOVERY_LIMIT in a row.
+  const failRound = (kind, text) => {
+    recordTaskStep(task, kind, text);
+    task.problems.push(text);
+    task.recoveries++;
+    return task.recoveries >= RECOVERY_LIMIT;
+  };
+
+  for (;;) {
+    if (task.cancelled) return cancelled();
+    setTaskState(task, `Running (step ${task.steps.length + 1}): reading the page and asking the model.`);
+    lastActionOutcome = null;
+    await suggestOnce(task.goal, taskHistory(task), taskAnswers(task)); // fresh capture + ONE proposal, validated against the live page
+    const out = lastActionOutcome;
+    lastActionOutcome = null;
+    if (task.cancelled) return cancelled(); // a reply that arrives after Stop is ignored
+    if (!out) return stop(`the page could not be read or the model did not answer (${statusEl.textContent}).`);
+    if (task.tabId === null) task.tabId = out.ctx.tabId;
+    else if (out.ctx.tabId !== task.tabId) return stop("the active tab changed.");
+    task.sigs.add(progressSig(out.ctx.norm));
+
+    if (out.discarded) {
+      if (failRound("not run", "The page changed while the model was deciding; it was read again.")) return recoveryEnd();
+      continue;
+    }
+    const { result, freshness } = out;
+    if (result.kind !== "valid") {
+      const why = result.kind === "malformed" ? result.reasons[0] : [...result.blocks, ...result.invalid][0];
+      if (failRound("rejected, not run", actClip(why, 220))) return recoveryEnd();
+      continue;
+    }
+    const p = result.proposal;
+    if (p.action === "ask_user") {
+      if (isRoutineQuestion(p.question) && task.bounces < PERMISSION_BOUNCE_LIMIT) {
+        // Not a question for the person: routine steps covered by the goal need no permission, and which field
+        // or button to use is decided from the page. Send it back to the model instead of stopping the task.
+        task.bounces++;
+        if (failRound("not asked", `"${actClip(p.question, 110)}" is not a question for the user. Routine steps the goal already covers need no permission, and which field or button to use is decided from the page. Choose a step now.`)) return recoveryEnd();
+        continue;
+      }
+      task.waitDoc = { url: out.ctx.urlStripped, documentToken: out.ctx.norm.documentToken };
+      const answer = await waitForAnswer(task, p.question);
+      if (task.cancelled || answer === null) return cancelled();
+      setTaskState(task, "Checking that the page is still the same before continuing.");
+      const changed = await checkSamePageAfterWait(task);
+      if (task.cancelled) return cancelled();
+      if (changed) return stop(`${changed}. Nothing was done on it. Start again on the page you want.`);
+      task.answers.push({ q: actClip(p.question, 200), a: answer });
+      recordTaskStep(task, "you were asked", `${actClip(p.question, 110)} You answered: ${answer}`);
+      task.recoveries = 0;
+      continue;
+    }
+    if (p.action === "cannot") return stop(`the model says it cannot continue: ${p.reason}`);
+    if (p.action === "done") return claimEnd(task, p);
+
+    const approval = pendingApproval;
+    if (!approval || freshness.state !== "fresh") {
+      // The REAL cause (for example "other controls changed" or "the page was replaced"), not a generic message.
+      const why = freshness.state !== "fresh"
+        ? `the page could not be confirmed unchanged (${freshness.reason})`
+        : executionEligibility(result, freshness).reason || "the step is not possible on this page";
+      dropApproval();
+      if (failRound("not run", actClip(why, 220))) return recoveryEnd();
+      continue;
+    }
+    if (approval.action === "search" && approval.plan && !approval.plan.skipFill) {
+      // Ordinary steps for search: type first (it needs no submit path), then submit from the updated page.
+      // The combined fill-and-submit proposal is only used here to submit a query that is already in the field.
+      dropApproval();
+      if (failRound("rejected, not run", "in a task, type the query first with a type step; then submit it on the next step from the updated page.")) return recoveryEnd();
+      continue;
+    }
+    const key = `${approval.action}|${approval.key}|${approval.text}|${approval.direction}`;
+    if (task.noChange.has(key)) {
+      dropApproval();
+      recordTaskStep(task, "not run", "it repeats an earlier step that changed nothing.");
+      task.noProgress++;
+      if (task.noProgress >= NO_PROGRESS_LIMIT) return noProgressEnd();
+      continue;
+    }
+    if (approval.confirm) {
+      // The existing pause for a consequential-looking control: nothing runs until the person confirms.
+      setTaskState(task, "Paused: this step needs your explicit confirmation (Confirm or Cancel; Stop ends the task).");
+      setStatus("Task paused: this step needs your explicit confirmation (or press Stop).", true);
+      const decision = await new Promise((resolve) => {
+        task.confirmWait = resolve;
+        showConfirmation(approval);
+      });
+      if (task.cancelled) return cancelled();
+      if (decision !== "confirmed" || pendingApproval !== approval) {
+        dropApproval();
+        return stop(decision === "dropped" ? "the page or tab changed while waiting for your confirmation." : "the confirmation was declined. Nothing further runs.");
+      }
+    }
+    if (task.cancelled) return cancelled();
+    if (pendingApproval !== approval) return stop("the page or tab changed before the step could run.");
+
+    setTaskState(task, `Running (step ${task.steps.length + 1}): executing the step.`);
+    const res = await startApproved(approval); // the existing executor: re-checks the live page, runs ONE step, captures again
+    const words = stepWords(approval);
+    if (task.cancelled) {
+      recordTaskStep(task, "stopped", `${words} -> ${res.state}`);
+      return cancelled();
+    }
+    if (res.state === "unconfirmed") {
+      recordTaskStep(task, "not confirmed", `${words} -> it is not known whether it ran`);
+      return stop(`${res.headline} ${res.why}`);
+    }
+    if (res.state === "cancelled") {
+      recordTaskStep(task, "not run", `${words} -> cancelled before it ran`);
+      return stop("the tab or page changed before the step ran. Nothing further runs.");
+    }
+    if (res.state !== "dispatched" && res.state !== "partial") {
+      // Refused or failed: the guards said no and NOTHING was dispatched. That is a recovery, not "no progress".
+      if (failRound("not run", `${actClip(`${res.headline} ${res.why || ""}`.replace(/^Not done: /, ""), 150)} (step: ${actClip(words, 70)})`)) return recoveryEnd();
+      continue;
+    }
+    task.recoveries = 0; // something WAS dispatched
+    if (!res.after) {
+      recordTaskStep(task, "executed", `${words} -> dispatched, but the page could not be captured again`);
+      return stop("the page could not be captured again after a step, so progress cannot be checked. Nothing further runs.");
+    }
+    const sigAfter = progressSig(res.after.norm);
+    const progress = !task.sigs.has(sigAfter); // a state seen before is no progress (it also stops back-and-forth loops)
+    task.sigs.add(sigAfter);
+    const evidence = stepEvidence(task, approval, res, progress);
+    if (evidence) task.evidence.push(evidence);
+    if (res.state === "dispatched" && !progress) task.noChange.add(key);
+    const outcome = res.state === "partial"
+      ? `partly done (${actClip(res.why, 100)})`
+      : progress ? `done${evidence ? `; ${actClip(evidence, 110)}` : "; the page changed"}` : "done, but nothing observable changed";
+    recordTaskStep(task, "executed", `${words} -> ${outcome}`);
+    task.noProgress = progress ? 0 : task.noProgress + 1;
+
+    // Type-only goal: stop as soon as the requested text is in the field, verified. Nothing else is done.
+    if (approval.action === "type" && isTypeOnlyGoal(task.goal) && fieldHolds(approval, res.after)) {
+      return { ok: true, text: `Finished. The requested text was entered and verified: ${evidence}.` };
+    }
+    if (task.noProgress >= NO_PROGRESS_LIMIT) return noProgressEnd();
+  }
+}
+
+// The Start button: the one approval for this goal.
+async function startTask() {
+  const goal = input.value.trim();
+  if (goal === "" || inFlight || activeTask) return;
+  if (goal.length > MAX_QUESTION_CHARS) {
+    setStatus(`That goal is ${goal.length} characters; goals are limited to ${MAX_QUESTION_CHARS}. Shorten it and try again.`, true);
+    return;
+  }
+  const task = {
+    goal, tabId: null, cancelled: false, cancelReason: "", confirmWait: null, answerWait: null, waitDoc: null,
+    steps: [], answers: [], sigs: new Set(), noChange: new Set(), noProgress: 0, recoveries: 0, problems: [], bounces: 0,
+    evidence: [], lastText: "", resultsObserved: false,
+  };
+  activeTask = task;
+  taskSection.hidden = false;
+  taskGoal.textContent = `Goal: ${goal}`;
+  taskSteps.textContent = "";
+  taskAnswerBox.hidden = true;
+  taskResult.textContent = "Running. You approved this goal by pressing Start; press Stop to end it.";
+  setBusy(false); // buttons follow activeTask
+  let end;
+  try {
+    end = await runTaskLoop(task);
+  } catch (error) {
+    end = { ok: false, text: `Stopped: unexpected error (${actClip(String(error && error.message ? error.message : error), 160)}).` };
+  } finally {
+    resolveTaskConfirm(task, "cancelled");
+    resolveTaskAnswer(task, null);
+    activeTask = null; // the record of steps and answers goes with it
+    taskAnswerBox.hidden = true;
+    dropApproval();
+    setBusy(false);
+  }
+  taskResult.textContent = `${end.text} (${task.steps.length} step(s) recorded in this run.)`;
+  setStatus(end.text, !end.ok);
+}
+
 // Separate mode: never runs for Send or Ask. The goal is what the user typed.
 async function suggestNextAction() {
   const goal = input.value.trim();
   if (goal === "") return; // empty input does nothing
-  if (inFlight) return; // same guard as Send and Ask
+  if (inFlight || activeTask) return; // same guard as Send and Ask
 
   if (goal.length > MAX_QUESTION_CHARS) {
     setStatus(`That goal is ${goal.length} characters; goals are limited to ${MAX_QUESTION_CHARS}. Shorten it and try again.`, true);
     return;
   }
 
+  await suggestOnce(goal, null);
+}
+
+// One round: fresh capture, then ONE proposal. `history` is set only inside a task.
+async function suggestOnce(goal, history, answers) {
   await runRequest("Reading the page's controls...", async () => {
     clearPageContext(); // never mix an older Q&A capture with this mode
     actionContext = null;
@@ -2121,8 +2535,8 @@ async function suggestNextAction() {
     actionContext = ctx;
     setStatus("Controls captured. Asking Ollama for one next step... (the first request can take a minute while the model loads)");
     return {
-      prompt: buildActionPrompt(goal, ctx.norm, ctx.snapshot, ctx.packed),
-      system: ACTION_SYSTEM_PROMPT,
+      prompt: buildActionPrompt(goal, ctx.norm, ctx.snapshot, ctx.packed, history, answers),
+      system: history ? `${ACTION_SYSTEM_PROMPT}\n${TASK_ADDENDUM}` : ACTION_SYSTEM_PROMPT,
       format: ACTION_SCHEMA,
       action: { ctx, goal },
       showStats: true,
@@ -2131,6 +2545,7 @@ async function suggestNextAction() {
 }
 
 function stopRequest() {
+  if (activeTask) cancelTask("you pressed Stop"); // then the in-flight request or undispatched step is cancelled below
   // An approved action that has not been dispatched yet can still be cancelled. One that
   // has been dispatched cannot be undone: Stop then only skips the follow-up capture.
   if (activeExecution && !activeExecution.cancelled) {
@@ -2167,7 +2582,7 @@ function scheduleAutoCapture() {
 async function runAutoCapture() {
   autoTimer = null;
   if (!autoEnabled) return;
-  if (inFlight) {
+  if (inFlight || activeTask) {
     autoPending = true; // do not interleave with a model request or an approved action
     return;
   }
@@ -2234,6 +2649,14 @@ input.addEventListener("keydown", (event) => {
 });
 
 stopButton.addEventListener("click", stopRequest);
+startButton.addEventListener("click", startTask);
+taskContinue.addEventListener("click", submitTaskAnswer);
+taskAnswer.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    submitTaskAnswer();
+  }
+});
 approveButton.addEventListener("click", approveProposal);
 confirmButton.addEventListener("click", confirmProposal);
 cancelConfirmButton.addEventListener("click", cancelConfirmation);
@@ -2244,6 +2667,7 @@ suggestButton.addEventListener("click", suggestNextAction);
 // need no extra permission; they only tell us that something changed.)
 if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
   chrome.tabs.onActivated.addListener(({ tabId }) => {
+    if (activeTask && (activeTask.tabId === null || tabId !== activeTask.tabId)) cancelTask("you switched tabs");
     cancelUndispatchedExecution(tabId, "You switched tabs before the action ran.");
     // Any approval belongs to the page that was shown, so it ends the moment the active tab changes.
     dropApproval();
@@ -2277,6 +2701,7 @@ if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onActivated) {
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
+    if (activeTask && tabId === activeTask.tabId) cancelTask("the tab was closed");
     if (activeExecution && tabId === activeExecution.approval.tabId) cancelUndispatchedExecution(-1, "The tab was closed before the action ran.");
     if (pageContext && tabId === pageContext.tabId) {
       clearPageContext("That tab was closed.");

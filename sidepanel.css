@@ -428,3 +428,36 @@ textarea:focus-visible {
   margin-right: 6px;
   font-size: 13px;
 }
+
+/* A running task: the goal, a short list of its steps, and how it ended. */
+#task-goal {
+  font: 600 15px/1.4 var(--sans);
+}
+#task-steps {
+  margin: 6px 0 0;
+  padding: 0 0 0 18px;
+  font-size: 12px;
+}
+#task-result {
+  font-weight: 600;
+}
+
+/* The task asked a question and waits for the person's answer. */
+#task-answer-box {
+  margin-top: 8px;
+  padding: 8px;
+  border: 2px solid var(--black);
+  border-radius: 8px;
+}
+#task-question {
+  font: 600 15px/1.4 var(--sans);
+}
+#task-answer {
+  width: 100%;
+  margin-top: 4px;
+  box-sizing: border-box;
+}
+#task-continue {
+  margin-top: 6px;
+  font-size: 13px;
+}

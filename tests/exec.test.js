@@ -10,6 +10,8 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const { spawn } = require("child_process");
+const realFetchGlobal = global.fetch; // fake-panel.js replaces fetch and shortens timers; the live-model run (LIVE_MODEL=1) needs the real ones
+const realSetTimeoutGlobal = global.setTimeout;
 const { load } = require("./fake-panel.js");
 const root = path.join(__dirname, "..");
 const out = path.join(__dirname, ".out");
@@ -18,7 +20,7 @@ const results = [];
 const ok = (name, cond, extra = "") => results.push(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  -> " + String(extra).slice(0, 300) : ""}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A gate that never opens must not hang the run: report what passed so far and stop.
-setTimeout(() => { console.log(results.join("\n")); console.error("exec test: TIMED OUT after 300 s (a gated step never happened)"); process.exit(3); }, 300000).unref();
+setTimeout(() => { console.log(results.join("\n")); console.error("exec test: TIMED OUT after 300 s (a gated step never happened)"); process.exit(3); }, process.env.LIVE_MODEL ? 3600000 : 300000).unref();
 
 const LOGGER = `<script>window.__log=[];
 document.addEventListener('click',e=>__log.push('click:'+((e.target.textContent||e.target.name||e.target.localName)+'').trim()),true);
@@ -49,6 +51,15 @@ const PAGES = {
   "/search-settings.html": pageP("Settings", `<main><h1>Settings</h1><form action="/settings" method="post"><input type="search" name="filter" aria-label="Search"><label>Display name <input type="text" name="n"></label><button type="submit">Save</button></form></main>`),
   "/search-mutating.html": pageP("Shoes shop", `<header><form role="search" action="/results.html" method="get">${SEARCH_BOX()}<button type="submit">Search</button></form></header><main><h1>Shoes shop</h1></main>`, `<script>document.querySelector('[name=q]').addEventListener('input', (e) => { e.target.value = e.target.value.toUpperCase(); });</script>`),
   "/search-disabling.html": pageP("Shoes shop", `<header><form role="search" action="/results.html" method="get">${SEARCH_BOX()}<button type="submit">Search</button></form></header><main><h1>Shoes shop</h1></main>`, `<script>document.querySelector('[name=q]').addEventListener('input', () => { document.querySelector('header button').disabled = true; });</script>`),
+  "/search-bare.html": pageP("Shoes shop", `<header><div class="bar"><input type="text" name="q" aria-label="Search for products, brands and more" autocomplete="off"><button type="button" aria-label="Search" onclick="location.href='/results.html?q='+encodeURIComponent(document.querySelector('[name=q]').value)">&#128269;</button></div></header><main><h1>Shoes shop</h1></main>`),
+  "/search-bare-late.html": pageP("Shoes shop", `<header><div class="bar"><input type="text" name="q" aria-label="Search for products, brands and more" autocomplete="off"><button type="button" aria-label="Search" disabled onclick="location.href='/results.html?q='+encodeURIComponent(document.querySelector('[name=q]').value)">&#128269;</button></div></header><main><h1>Shoes shop</h1></main>`, `<script>document.querySelector('[name=q]').addEventListener('input', (e) => { document.querySelector('.bar button').disabled = e.target.value === ''; });</script>`),
+  "/search-bare-two.html": pageP("Shoes shop", `<header><div class="bar"><input type="text" name="q" aria-label="Search for products, brands and more" autocomplete="off"><button type="button" aria-label="Search">&#128269;</button><button type="button" aria-label="Voice search">&#127908;</button></div></header><main><h1>Shoes shop</h1></main>`),
+  "/search-bare-icon.html": pageP("Shoes shop", `<header><div class="bar"><input type="text" name="q" aria-label="Search for products, brands and more" autocomplete="off"><button type="button">&#128269;</button></div></header><main><h1>Shoes shop</h1></main>`),
+  "/cards.html": page("Home", `<header><nav>${Array.from({ length: 40 }, (_, i) => `<a href="/nav/${i}">Menu entry number ${i}</a>`).join(" ")}</nav></header><aside>${Array.from({ length: 40 }, (_, i) => `<a href="/sub/${i}">Subscription channel ${i}</a>`).join(" ")}</aside>
+<main><h1>Home</h1><div class="grid">
+<div class="card"><a href="/watch/1">24 hours inside a giant maze</a><div><a href="/c/mrbeast">MrBeast</a> <span>230M views</span></div></div>
+<div class="card"><a href="/watch/2">How to cook perfect rice</a><div><a href="/c/anna">Chef Anna</a> <span>1M views</span></div></div>
+<div class="card"><a href="/watch/3">Building a tiny house</a><div><a href="/c/tiny">Tiny Homes Daily</a> <span>400K views</span></div></div></div></main>`),
   "/form.html": page("Web form", `<main><h1>Web form</h1><form id="f">
 <label>Text input <input type="text" id="my-text-id" name="my-text"></label><br>
 <label>Prefilled <input type="text" name="prefilled" value="OLD_VALUE_MARK"></label><br>
@@ -715,12 +726,356 @@ const PAGES = {
     await A.confirmProposal(); await idle();
     ok("E: and a late Confirm click then does nothing", dispatches() === 0);
 
+    // =========================================================================================
+    // F. The task loop: ONE Start approval, then ordinary steps (real Chrome DOM, scripted model)
+    // =========================================================================================
+    let liveCalls = 0;
+    const until = async (fn, ms = 15000) => { for (let i = 0; i < ms / 25; i++) { if (fn()) return true; await sleep(25); } return false; };
+    const taskIdle = async () => { for (let i = 0; i < 1600 && (A.getActiveTask() || A.getInFlight()); i++) await sleep(25); };
+    // Each model call takes the next scripted reply (the last one repeats). A reply is (ctx) => object or a promise of one.
+    const scriptTask = (replies) => {
+      let n = 0;
+      p.state.fetchCalls = [];
+      p.state.fetchImpl = async () => { const r = replies[Math.min(n++, replies.length - 1)]; return reply({ ...blank, ...(await r(A.getActionContext())) }); };
+    };
+    const start = async (goal) => { ids["prompt-input"].value = goal; ids["start-button"].fire("click"); await taskIdle(); };
+    const taskResult = () => ids["task-result"].textContent;
+    const taskSteps = () => ids["task-steps"].children.map((c) => c.textContent);
+    const performed = () => p.state.scriptCalls.filter((c) => c.func === "performApprovedAction").map((c) => c.args[0].action);
+    const typeStep = (text) => (c) => ({ action: "type", target_id: fieldId(c), text });
+    const btn = (name) => (c) => ({ action: "click", target_id: idOf(c, name, "button") });
+    const doneStep = (reason) => () => ({ action: "done", reason });
+    const boxShown = () => ids["task-answer-box"].hidden === false;
+    const startNoWait = (goal) => { ids["prompt-input"].value = goal; ids["start-button"].fire("click"); };
+    const answerWith = (text) => { ids["task-answer"].value = text; ids["task-continue"].fire("click"); };
+    const taskReset = async (path2) => { await open(path2); requests.length = 0; await clearSlog(); resetCounters(); p.state.scriptCalls.length = 0; };
+
+    // LIVE_MODEL=1: run the loop with the real local model instead of scripted replies, report what happened, stop.
+    if (process.env.LIVE_MODEL) {
+      p.state.fetchImpl = (u, o) => { liveCalls++; return realFetchGlobal(u, o); };
+      global.setTimeout = realSetTimeoutGlobal;
+      const liveRuns = [
+        ["search (button)", "search for black Nike shoes", "/search.html"], ["search (button)", "search for black Nike shoes", "/search.html"], ["search (button)", "search for black Nike shoes", "/search.html"],
+        ["search (form only)", "search for black Nike shoes", "/search-form-only.html"], ["search (form only)", "search for black Nike shoes", "/search-form-only.html"],
+        ["type only", "type black Nike shoes into the search box", "/search.html"], ["type only", "type black Nike shoes into the search box", "/search.html"], ["type only", "type black Nike shoes into the search box", "/search.html"],
+      ];
+      for (const [label, goal, path2] of liveRuns) {
+        liveCalls = 0;
+        await taskReset(path2);
+        ids["prompt-input"].value = goal; ids["start-button"].fire("click");
+        for (let i = 0; i < 12000 && (A.getActiveTask() || A.getInFlight()); i++) await sleep(25);
+        console.log(`LIVE [${label}] "${goal}"\n   result: ${taskResult()}\n   steps: ${taskSteps().join(" | ")}\n   model calls ${liveCalls}, dispatched ${JSON.stringify(performed())}, search requests ${JSON.stringify(searchReqs())}`);
+      }
+      await cleanup();
+      process.exit(0);
+    }
+    ok("F: isTypeOnlyGoal: entering text only is type-only; anything that also searches, clicks or goes on is not", A.isTypeOnlyGoal("type black Nike shoes into the search box") && A.isTypeOnlyGoal("enter hello in the text input") && !A.isTypeOnlyGoal("search for black Nike shoes") && !A.isTypeOnlyGoal("type shoes and press enter") && !A.isTypeOnlyGoal("type shoes then click go") && !A.isTypeOnlyGoal("open the sale page"));
+
+    // -- search as ORDINARY steps: type, then submit chosen from the UPDATED page, then done --
+    await taskReset("/search.html");
+    scriptTask([typeStep("black Nike shoes"), btn("Search"), doneStep("The results page for black Nike shoes is showing.")]);
+    await start(searchGoal);
+    ok("F: ONE Start click ran the whole task: 3 model calls, 2 steps, no Approve click, nothing left pending", p.state.fetchCalls.length === 3 && dispatches() === 2 && A.getPendingApproval() === null && approve().hidden === true && A.getActiveTask() === null, `fetches ${p.state.fetchCalls.length} dispatches ${dispatches()}`);
+    ok("F: the steps were ORDINARY ones (type, then click the Search button); no combined search operation was used", JSON.stringify(performed()) === '["type","click"]', JSON.stringify(performed()));
+    sl = await slog();
+    ok("F: the page saw typing, then the click, then the submit - once each - and the server got exactly one search request", sl.indexOf("input:q:insertText") >= 0 && sl.indexOf("input:q:insertText") < sl.indexOf("click:Search") && sl.indexOf("click:Search") < sl.indexOf("submit") && sl.filter((x) => x === "submit").length === 1 && JSON.stringify(searchReqs()) === '["black Nike shoes"]', sl.join(",") + " " + JSON.stringify(searchReqs()));
+    ok("F: the task reports success only with observed evidence (results observed on the new page)", /^Finished\. The model reports the goal reached/.test(taskResult()) && /Results observed: the page changed and its address contains your query/.test(taskResult()), taskResult());
+    ok("F: each step is listed with what happened, and the record is gone afterwards", taskSteps().length === 2 && /^1\. executed: Type "black Nike shoes" into the text field.* -> done; the field holds exactly "black Nike shoes"/.test(taskSteps()[0]) && /^2\. executed: Click the button "Search"\. -> done; Results observed/.test(taskSteps()[1]) && A.getActiveTask() === null, taskSteps().join(" | "));
+    const b0 = p.state.fetchCalls[0].body; const b1 = p.state.fetchCalls[1].body;
+    ok("F: the model is told it is in a task, and each later call carries the steps so far (so it can avoid repeats); the first says none yet", /TASK MODE/.test(b0.system) && /STEPS SO FAR IN THIS TASK[\s\S]*\(none yet\)/.test(b0.prompt) && /STEPS SO FAR IN THIS TASK[\s\S]*1\. executed: Type "black Nike shoes" into the text field.*-> done/.test(b1.prompt) && !/\[a\d+:E\d+\]/.test(b1.prompt.split("STEPS SO FAR")[1]), b1.prompt.split("STEPS SO FAR")[1]);
+    ok("F: after it ends the controls are usable again", ids["suggest-button"].disabled === false && ids["start-button"].disabled === false && ids["stop-button"].disabled === true && ids["prompt-input"].readOnly === false);
+
+    // -- inside a task the combined fill-and-submit proposal is not used: type first --
+    await taskReset("/search.html");
+    scriptTask([(c) => ({ action: "search", target_id: fieldId(c), text: "black Nike shoes" }), typeStep("black Nike shoes"), btn("Search"), doneStep("The results for black Nike shoes are showing.")]);
+    await start(searchGoal);
+    ok("F: a combined 'search' while the field does not hold the query is turned down in a task (nothing dispatched for it); the model then types, then submits", /^1\. rejected, not run: in a task, type the query first/.test(taskSteps()[0]) && JSON.stringify(performed()) === '["type","click"]' && JSON.stringify(searchReqs()) === '["black Nike shoes"]' && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + JSON.stringify(performed()));
+
+    // -- the form-only search: submission by the existing path, chosen from the updated page --
+    await taskReset("/search-form-only.html");
+    scriptTask([typeStep("black Nike shoes"), (c) => ({ action: "search", target_id: fieldId(c), text: "black Nike shoes" }), doneStep("Results for black Nike shoes are showing.")]);
+    await start(searchGoal);
+    sl = await slog();
+    ok("F: no submit button: step 2 uses the existing submission support (the field already holds the query, so it is only submitted, not retyped)", JSON.stringify(performed()) === '["type","search"]' && sl.filter((x) => x.startsWith("input:")).length === 1 && sl.filter((x) => x === "submit").length === 1 && JSON.stringify(searchReqs()) === '["black Nike shoes"]' && /^Finished\./.test(taskResult()), sl.join(",") + " | " + taskSteps().join(" | ") + " | " + taskResult());
+
+    // -- a Type-only goal stops once the text is entered and verified --
+    await taskReset("/search.html");
+    scriptTask([typeStep("black Nike shoes"), btn("Search"), btn("Search")]);
+    await start("type black Nike shoes into the search box");
+    sl = await slog();
+    ok("F: Type-only goal: it stops right after the text is in the field and verified (1 step, the model is not asked again), and submits nothing", p.state.fetchCalls.length === 1 && dispatches() === 1 && (await valueOf("[name=q]")) === "black Nike shoes" && searchReqs().length === 0 && !sl.some((x) => x === "submit" || x.startsWith("click:")) && /^Finished\. The requested text was entered and verified: the field holds exactly "black Nike shoes"/.test(taskResult()), taskResult());
+
+    // -- stops: the model needs the person, cannot continue, claims success without evidence --
+    await taskReset("/search.html");
+    scriptTask([(c) => ({ action: "ask_user", question: "Which shoe size?" })]);
+    startNoWait(searchGoal);
+    await until(boxShown);
+    ids["stop-button"].fire("click");
+    await taskIdle();
+    ok("F: ask_user no longer ends the task by itself: it waits, and Stop ends it with nothing dispatched", dispatches() === 0 && /^Stopped: you pressed Stop/.test(taskResult()) && A.getActiveTask() === null);
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "cannot", reason: "There is no search box I can use." })]);
+    await start(searchGoal);
+    ok("F: cannot stops the task", dispatches() === 0 && /^Stopped: the model says it cannot continue: There is no search box/.test(taskResult()));
+    await taskReset("/search.html");
+    scriptTask([doneStep("It is already done.")]);
+    await start(searchGoal);
+    ok("F: 'done' before anything was done is NOT believed: stopped, unverified", dispatches() === 0 && /^Stopped, unverified: the model says the goal is reached/.test(taskResult()) && !/^Finished/.test(taskResult()));
+    await taskReset("/search.html");
+    scriptTask([typeStep("black Nike shoes"), doneStep("The search is complete.")]);
+    await start(searchGoal);
+    ok("F: 'done' for a search after only typing is NOT believed: no results were observed, so stopped, unverified (and nothing was submitted)", /^Stopped, unverified: .*no search results were observed/.test(taskResult()) && searchReqs().length === 0 && dispatches() === 1, taskResult());
+
+    // -- repeated no progress --
+    await taskReset("/short.html");
+    scriptTask([(c) => ({ action: "click", target_id: idOf(c, "Only button", "button") })]);
+    await start("click the button until something happens");
+    ok("F: a step that changes nothing is not repeated: stopped after 2 rounds without progress (1 dispatch, not 2)", dispatches() === 1 && p.state.fetchCalls.length === 2 && /^Stopped: no progress in 2 rounds in a row/.test(taskResult()) && /nothing observable changed/.test(taskSteps()[0]) && /not run: it repeats an earlier step that changed nothing/.test(taskSteps()[1]), taskSteps().join(" | "));
+
+    // -- the guards still hold inside a task --
+    await taskReset("/form.html");
+    scriptTask([(c) => ({ action: "type", target_id: idOf(c, "Password"), text: "hello" })]);
+    await start("type hello into the password");
+    ok("F: a secret field is still refused inside a task: rejected three times with nothing dispatched -> stopped as a failure to find a safe step (not as no progress), nothing typed", dispatches() === 0 && (await valueOf("[name=my-password]")) === "" && /^Stopped: could not find a valid, safe next step after 3 attempts/.test(taskResult()) && /unsupported/.test(taskResult()) && /^1\. rejected, not run: .*unsupported/.test(taskSteps()[0]), taskSteps().join(" | "));
+    await taskReset("/form.html");
+    scriptTask([(c) => ({ action: "type", target_id: idOf(c, "Disabled input"), text: "hello" })]);
+    await start("type hello into the disabled input");
+    ok("F: a disabled field is still refused inside a task", dispatches() === 0 && /is disabled/.test(taskSteps()[0]) && /^Stopped: could not find a valid, safe next step/.test(taskResult()));
+    await taskReset("/form.html");
+    scriptTask([(c) => ({ action: "type", target_id: idOf(c, "Readonly input"), text: "hello" })]);
+    await start("type hello into the readonly input");
+    ok("F: a read-only field is still refused inside a task", dispatches() === 0 && /is read-only/.test(taskSteps()[0]) && (await valueOf("[name=my-readonly]")) === "Readonly input");
+    await taskReset("/search.html");
+    scriptTask([
+      typeStep("black Nike shoes"),
+      async (c) => { const id = idOf(c, "Search", "button"); await evalIn("document.querySelector('header button').textContent = 'Go'; 0"); return { action: "click", target_id: id }; }, // the control changes after it was chosen
+      btn("Go"),
+      doneStep("The results for black Nike shoes are showing."),
+    ]);
+    await start(searchGoal);
+    ok("F: a stale target is still refused inside a task (the button changed after the model chose it): that step is not run, the next round re-reads the page and uses the new state", /^2\. not run: the page could not be confirmed unchanged/.test(taskSteps()[1]) && JSON.stringify(performed()) === '["type","click"]' && JSON.stringify(searchReqs()) === '["black Nike shoes"]' && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+
+    // -- the consequential-looking control keeps its explicit pause --
+    await taskReset("/addremove.html");
+    scriptTask([btn("Add Element"), (c) => ({ action: "click", target_id: nthDelete(c, 1).id }), doneStep("The added element is gone.")]);
+    ids["prompt-input"].value = "add an element and then delete it"; ids["start-button"].fire("click");
+    const paused = await until(() => ids["confirm-box"].hidden === false);
+    ok("F: the consequential step PAUSES the task for its explicit confirmation; the routine step before it ran without any approval", paused && A.getActiveTask() !== null && dispatches() === 1 && p.state.fetchCalls.length === 2 && ids["approve-button"].hidden === true && /^Operation: Click the button "Delete"/.test(ids["confirm-operation"].textContent) && /Unknown: the real effect/.test(ids["confirm-unknown"].textContent), `paused ${paused} dispatches ${dispatches()}`);
+    await A.approveProposal(); await sleep(60);
+    ok("F: while paused, pressing Approve by other means does nothing; the Delete button is still there", dispatches() === 1 && (await evalIn("document.querySelectorAll('.added-manually').length")) === 1);
+    ids["confirm-button"].fire("click"); ids["confirm-button"].fire("click");
+    await taskIdle();
+    ok("F: after the person confirms, it runs once (even with a double click) and the task continues to a finished state", dispatches() === 2 && (await evalIn("document.querySelectorAll('.added-manually').length")) === 0 && /^Finished\./.test(taskResult()), taskResult());
+    await taskReset("/addremove.html");
+    scriptTask([btn("Add Element"), (c) => ({ action: "click", target_id: nthDelete(c, 1).id })]);
+    ids["prompt-input"].value = "add an element and then delete it"; ids["start-button"].fire("click");
+    await until(() => ids["confirm-box"].hidden === false);
+    ids["cancel-confirm-button"].fire("click");
+    await taskIdle();
+    ok("F: declining the confirmation ends the task; the consequential step never ran", dispatches() === 1 && (await evalIn("document.querySelectorAll('.added-manually').length")) === 1 && /^Stopped: the confirmation was declined/.test(taskResult()) && A.getActiveTask() === null && ids["confirm-box"].hidden === true);
+
+    // -- Stop: a late reply is ignored and nothing further is dispatched --
+    await taskReset("/search.html");
+    let reachedM; const reachedMP = new Promise((r) => (reachedM = r));
+    let releaseM; const waitM = new Promise((r) => (releaseM = r));
+    scriptTask([typeStep("black Nike shoes"), async (c) => { const id = idOf(c, "Search", "button"); reachedM(); await waitM; return { action: "click", target_id: id }; }]);
+    ids["prompt-input"].value = searchGoal; ids["start-button"].fire("click");
+    await reachedMP; // step 1 ran; the model is deciding step 2
+    ok("F: while the task runs, Stop is available and the other buttons are off", ids["stop-button"].disabled === false && ids["suggest-button"].disabled === true && ids["start-button"].disabled === true && dispatches() === 1);
+    ids["stop-button"].fire("click");
+    releaseM(); // the reply arrives late
+    await taskIdle(); await sleep(150);
+    ok("F: Stop: the late reply is ignored, nothing further was dispatched (step 1 stays done), no search request", dispatches() === 1 && searchReqs().length === 0 && /^Stopped: you pressed Stop\. Nothing further was dispatched; steps already dispatched are not undone/.test(taskResult()) && A.getActiveTask() === null && (await valueOf("[name=q]")) === "black Nike shoes", taskResult());
+    await taskReset("/search.html");
+    let reachedN; const reachedNP = new Promise((r) => (reachedN = r));
+    let releaseN; const waitN = new Promise((r) => (releaseN = r));
+    scriptTask([typeStep("black Nike shoes"), btn("Search")]);
+    gate = { func: "performApprovedAction", nth: 1, reached: reachedN, wait: waitN };
+    ids["prompt-input"].value = searchGoal; ids["start-button"].fire("click");
+    await reachedNP; // step 1 is being dispatched
+    ids["stop-button"].fire("click");
+    ok("F: Stop during a dispatch says it cannot undo it", /already dispatched\. Stop cannot undo it/.test(ids.status.textContent), ids.status.textContent);
+    releaseN(); gate = null;
+    await taskIdle();
+    ok("F: ...the dispatched step stays (the field was typed), and the task ends without another model call or step", (await valueOf("[name=q]")) === "black Nike shoes" && p.state.fetchCalls.length === 1 && dispatches() === 1 && /^Stopped: you pressed Stop/.test(taskResult()) && A.getActiveTask() === null, taskResult());
+    await taskReset("/search.html");
+    let reachedO; const reachedOP = new Promise((r) => (reachedO = r));
+    let releaseO; const waitO = new Promise((r) => (releaseO = r));
+    scriptTask([async (c) => { const id = fieldId(c); reachedO(); await waitO; return { action: "type", target_id: id, text: "black Nike shoes" }; }]);
+    ids["prompt-input"].value = searchGoal; ids["start-button"].fire("click");
+    await reachedOP;
+    p.handlers.activated({ tabId: 99 }); // the person switched to another tab
+    releaseO();
+    await taskIdle();
+    ok("F: switching tabs ends the task and a late proposal is not run", dispatches() === 0 && (await valueOf("[name=q]")) === "" && /^Stopped: you switched tabs/.test(taskResult()) && A.getActiveTask() === null, taskResult());
+    await settleAuto();
+
+
+    // =========================================================================================
+    // G. Waiting for an answer, recovery vs no progress, verbose reasons, changing pages, search discovery, card context
+    // =========================================================================================
+    // -- ask_user: a waiting state with a real answer box; the SAME task resumes --
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "Which shoe size do you want?" }), typeStep("black Nike shoes"), btn("Search"), doneStep("The results for black Nike shoes are showing.")]);
+    startNoWait(searchGoal);
+    const waiting = await until(boxShown);
+    ok("G: ask_user WAITS: the task stays active, the question and an answer box are shown, Stop is on, nothing was dispatched", waiting && A.getActiveTask() !== null && dispatches() === 0 && /Which shoe size do you want\?/.test(ids["task-question"].textContent) && /^Waiting for your answer/.test(taskResult()) && ids["stop-button"].disabled === false && ids["start-button"].disabled === true);
+    const callsBefore = p.state.fetchCalls.length;
+    ids["task-continue"].fire("click"); await sleep(80);
+    ok("G: Continue with an empty answer does nothing (still waiting, no new model call)", boxShown() && A.getActiveTask() !== null && p.state.fetchCalls.length === callsBefore);
+    answerWith("size 10");
+    await taskIdle();
+    const gc = p.state.fetchCalls;
+    ok("G: after Continue the SAME task resumes from a fresh capture: the model sees the answer and the earlier step, the task finishes, the box is gone", gc.length === 4 && !/USER ANSWERS/.test(gc[0].body.prompt) && /USER ANSWERS[\s\S]*Which shoe size do you want\?[\s\S]*size 10/.test(gc[1].body.prompt) && /STEPS SO FAR[\s\S]*1\. you were asked:/.test(gc[1].body.prompt) && gc[1].body.prompt.includes(searchGoal) && dispatches() === 2 && /^Finished\./.test(taskResult()) && ids["task-answer-box"].hidden === true && A.getActiveTask() === null, taskResult());
+    ok("G: the answer is a user answer, not a step: the first step line says you were asked", /^1\. you were asked: Which shoe size/.test(taskSteps()[0]) && /^2\. executed:/.test(taskSteps()[1]));
+
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "Which shoe size do you want?" })]);
+    startNoWait(searchGoal); await until(boxShown);
+    ok("G: a new task starts with none of the earlier answers", !/USER ANSWERS/.test(p.state.fetchCalls[0].body.prompt));
+    ids["stop-button"].fire("click");
+    await taskIdle();
+    ok("G: Stop works while waiting: the task ends, the box is hidden, nothing was dispatched, no further model call", /^Stopped: you pressed Stop/.test(taskResult()) && A.getActiveTask() === null && ids["task-answer-box"].hidden === true && dispatches() === 0 && p.state.fetchCalls.length === 1, taskResult());
+
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "Which shoe size do you want?" })]);
+    startNoWait(searchGoal); await until(boxShown);
+    await open("/search.html"); // the same address, but a new document
+    answerWith("size 10");
+    await taskIdle();
+    ok("G: the page was reloaded while waiting: the task stops (it does not act on the new document), nothing dispatched, no new model call", /^Stopped: the page was reloaded or replaced while the task was waiting/.test(taskResult()) && dispatches() === 0 && p.state.fetchCalls.length === 1, taskResult());
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "Which shoe size do you want?" })]);
+    startNoWait(searchGoal); await until(boxShown);
+    await open("/index.html");
+    answerWith("size 10");
+    await taskIdle();
+    ok("G: the address changed while waiting: the task stops, nothing dispatched", /^Stopped: the page address changed while the task was waiting/.test(taskResult()) && dispatches() === 0 && p.state.fetchCalls.length === 1, taskResult());
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "Which shoe size do you want?" })]);
+    startNoWait(searchGoal); await until(boxShown);
+    p.handlers.activated({ tabId: 99 });
+    await taskIdle();
+    ok("G: switching tabs while waiting ends the task and hides the box", /^Stopped: you switched tabs/.test(taskResult()) && ids["task-answer-box"].hidden === true && A.getActiveTask() === null && dispatches() === 0, taskResult());
+    await settleAuto();
+
+    // -- fewer questions: a permission-style question goes back to the model, a real one reaches the person --
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "May I use the search field?" }), typeStep("black Nike shoes"), btn("Search"), doneStep("The results for black Nike shoes are showing.")]);
+    await start(searchGoal);
+    ok("G: 'May I use the search field?' is not put to the person: it is sent back, the model then continues and the task finishes", !boxShown() && /^1\. not asked:/.test(taskSteps()[0]) && dispatches() === 2 && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+    ok("G: ...and the next model call is told why (the step line is in STEPS SO FAR)", /STEPS SO FAR[\s\S]*1\. not asked:[\s\S]*not a question for the user/.test(p.state.fetchCalls[1].body.prompt));
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "ask_user", question: "May I use the search field?" })]);
+    startNoWait(searchGoal);
+    const asked = await until(boxShown);
+    ok("G: the same question repeated after 2 bounces is passed to the person (bounded, not an endless loop)", asked && p.state.fetchCalls.length === 3 && /^1\. not asked:/.test(taskSteps()[0]) && /^2\. not asked:/.test(taskSteps()[1]), String(p.state.fetchCalls.length));
+    ids["stop-button"].fire("click"); await taskIdle();
+
+    // -- nothing dispatched is a recovery, not "no progress" --
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "click", target_id: "a1:E999" }), () => ({ action: "click", target_id: "a1:E998" }), typeStep("black Nike shoes"), btn("Search"), doneStep("The results for black Nike shoes are showing.")]);
+    await start(searchGoal);
+    ok("G: two rejected proposals in a row (nothing dispatched) do NOT use up the no-progress budget: the task goes on and finishes", /^1\. rejected, not run:/.test(taskSteps()[0]) && /^2\. rejected, not run:/.test(taskSteps()[1]) && dispatches() === 2 && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+    ok("G: ...and each rejection reason reaches the model on the next call", /STEPS SO FAR[\s\S]*1\. rejected, not run:/.test(p.state.fetchCalls[1].body.prompt) && /2\. rejected, not run:/.test(p.state.fetchCalls[2].body.prompt));
+    await taskReset("/search.html");
+    scriptTask([() => ({ action: "click", target_id: "a1:E999" })]);
+    await start(searchGoal);
+    ok("G: three rejections in a row stop the task clearly, with the causes listed, as a failure to find a step (not 'no progress')", dispatches() === 0 && p.state.fetchCalls.length === 3 && /^Stopped: could not find a valid, safe next step after 3 attempts in a row; nothing was dispatched for them\. The problems were: /.test(taskResult()) && !/no progress/.test(taskResult()), taskResult());
+
+    // -- a verbose reason is shortened, not a reason to refuse --
+    await taskReset("/search.html");
+    scriptTask([(c) => ({ ...typeStep("black Nike shoes")(c), rationale: "The search field is the right control for this goal. ".repeat(14) + "\nSecond line." })]);
+    await start("type black Nike shoes into the search box");
+    ok("G: a 700-character reason with a line break is shortened for display and the valid step runs (typed, verified, finished)", dispatches() === 1 && (await valueOf("[name=q]")) === "black Nike shoes" && /^1\. executed:/.test(taskSteps()[0]) && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+    await taskReset("/search.html");
+    scriptTask([(c) => ({ ...typeStep("black Nike shoes")(c), rationale: "x".repeat(2100) }), typeStep("black Nike shoes")]);
+    await start("type black Nike shoes into the search box");
+    ok("G: a 2100-character reason is still rejected (response-size bound), and the model then recovers with a valid step", /^1\. rejected, not run:/.test(taskSteps()[0]) && dispatches() === 1 && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+
+    // -- a page that changes while the model decides --
+    await taskReset("/search.html");
+    scriptTask([async (c) => { const id = fieldId(c); await evalIn("document.body.insertAdjacentHTML('afterbegin', '<button type=button>Banner</button>'); 0"); return { action: "type", target_id: id, text: "black Nike shoes" }; }]);
+    await start("type black Nike shoes into the search box");
+    ok("G: in a task, an unrelated control added while the model decided does not block a step whose own target is unchanged", dispatches() === 1 && (await valueOf("[name=q]")) === "black Nike shoes" && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+    await open("/search.html");
+    p.state.fetchImpl = async () => { await evalIn("document.body.insertAdjacentHTML('afterbegin', '<button type=button>Banner</button>'); 0"); return reply({ ...blank, ...typeStep("black Nike shoes")(A.getActionContext()) }); };
+    ids["prompt-input"].value = "type black Nike shoes into the search box";
+    await click(ids["suggest-button"]);
+    ok("G: outside a task the strict whole-page check still applies: the same change makes the proposal stale and not approvable", !approvable(), ids.status.textContent);
+    await taskReset("/search.html");
+    scriptTask([async (c) => { const id = fieldId(c); await evalIn("document.querySelector('[name=q]').remove(); 0"); return { action: "type", target_id: id, text: "black Nike shoes" }; }, () => ({ action: "cannot", reason: "The search field disappeared." })]);
+    await start("type black Nike shoes into the search box");
+    ok("G: in a task, a target that was REMOVED is still refused (nothing dispatched), and the cause is the real one", dispatches() === 0 && /^1\. not run: the page could not be confirmed unchanged \(/.test(taskSteps()[0]) && /^Stopped: the model says it cannot continue/.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+    await taskReset("/search.html");
+    scriptTask([async (c) => { const id = idOf(c, "Search", "button"); await evalIn("document.querySelector('header button').textContent = 'Go'; 0"); return { action: "click", target_id: id }; }, () => ({ action: "cannot", reason: "stop" })]);
+    await start(searchGoal);
+    ok("G: in a task, a RENAMED target is still refused (nothing dispatched)", dispatches() === 0 && /^1\. not run: the page could not be confirmed unchanged/.test(taskSteps()[0]), taskSteps().join(" | "));
+
+    // -- search without a form or landmark: discovered from the page, typing never needs it --
+    const bareField = (c) => idOf(c, "Search for products, brands and more", "text-field");
+    rs = await resolveOf("/search-bare.html");
+    ok("G: no form, no landmark, one enabled control labelled Search in the field's own container -> submit via that control", rs && rs.via === "control" && rs.submit.name === "Search" && rs.formKey === 0, JSON.stringify(rs));
+    rs = await resolveOf("/search-bare-late.html");
+    ok("G: the labelled control is disabled until something is typed -> no path yet, and the reason says it may enable after typing", rs && rs.via === "none" && /disabled/.test(rs.reason) && /after typing/.test(rs.reason), JSON.stringify(rs));
+    rs = await resolveOf("/search-bare-two.html");
+    ok("G: two search-labelled controls around the field -> ambiguous, not guessed", rs && rs.via === "ambiguous", JSON.stringify(rs));
+    rs = await resolveOf("/search-bare-icon.html");
+    ok("G: an unlabelled icon button is not guessed to be the search button", rs && rs.via === "none", JSON.stringify(rs));
+
+    await taskReset("/search-bare-late.html");
+    scriptTask([(c) => ({ action: "type", target_id: bareField(c), text: "black Nike shoes" }), btn("Search"), doneStep("The results for black Nike shoes are showing.")]);
+    await start(searchGoal);
+    sl = await slog();
+    ok("G: typing was allowed with no submit path; after typing the button is enabled, found in the NEXT capture and clicked: one search request, Enter never pressed", /^1\. executed: Type/.test(taskSteps()[0]) && /^2\. executed: Click the button "Search"/.test(taskSteps()[1]) && JSON.stringify(searchReqs()) === '["black Nike shoes"]' && !sl.includes("key:Enter") && /^Finished\./.test(taskResult()), taskSteps().join(" | ") + " | " + taskResult());
+    ok("G: the model was told typing is allowed and the submit path is not established yet (first capture) and later sees the SEARCH FIELD that submits via the control", /SEARCH FIELD \(typing allowed; submit path not established yet: [^)]*after typing/.test(p.state.fetchCalls[0].body.prompt) && /SEARCH FIELD \(typing allowed; submits via/.test(p.state.fetchCalls[1].body.prompt), (p.state.fetchCalls[0].body.prompt.match(/SEARCH FIELD[^\n]*/) || [""])[0]);
+    await taskReset("/search-bare-two.html");
+    scriptTask([(c) => ({ action: "type", target_id: bareField(c), text: "black Nike shoes" }), () => ({ action: "cannot", reason: "I cannot tell which control submits." })]);
+    await start(searchGoal);
+    sl = await slog();
+    ok("G: an ambiguous submit control does not block typing, and nothing is submitted (no Enter, no click)", dispatches() === 1 && (await valueOf("[name=q]")) === "black Nike shoes" && !sl.includes("key:Enter") && !sl.some((x) => x.startsWith("click:")) && searchReqs().length === 0, sl.join(","));
+
+    // -- coverage and same-card context --
+    await open("/cards.html");
+    p.state.fetchCalls = [];
+    p.state.fetchImpl = async () => reply({ ...blank, action: "cannot", reason: "inspection only" });
+    ids["prompt-input"].value = "open the MrBeast video";
+    await click(ids["suggest-button"]);
+    const cardPrompt = p.state.fetchCalls[0].body.prompt;
+    const tlines = cardPrompt.split("\n").filter((l) => /^a\d+:E\d+ \|/.test(l));
+    const line = (re) => (cardPrompt.split("\n").find((l) => /^a\d+:E\d+ \|/.test(l) && re.test(l)) || "");
+    ok("G: crowded page (80 header/sidebar links + 3 video cards): the main-content video links are listed, before the navigation and sidebar links, and the omission note and IDs are intact", /\[OMITTED: \d+ of \d+/.test(cardPrompt) && /24 hours inside a giant maze/.test(cardPrompt) && tlines.findIndex((l) => /giant maze/.test(l)) >= 0 && tlines.findIndex((l) => /giant maze/.test(l)) < (tlines.findIndex((l) => /Menu entry number/.test(l)) === -1 ? 1e9 : tlines.findIndex((l) => /Menu entry number/.test(l))) && /^a\d+:E\d+/.test(line(/giant maze/)), line(/giant maze/));
+    ok("G: the MrBeast video link carries its own card's channel and views as 'same card'", /same card: "[^"]*MrBeast[^"]*230M views/.test(line(/giant maze/)), line(/giant maze/));
+    ok("G: other cards are not merged: their links show their own creators and never MrBeast", /same card: "[^"]*Chef Anna/.test(line(/perfect rice/)) && !/MrBeast/.test(line(/perfect rice/)) && !/MrBeast/.test(line(/tiny house/)) && !/Chef Anna/.test(line(/giant maze/)), line(/perfect rice/));
+
+    // -- task-mode wording: no "Approve" prompt for routine steps, no "nothing has been clicked" after steps ran --
+    await taskReset("/search.html");
+    let reachedW; const reachedWP = new Promise((r) => (reachedW = r));
+    let releaseW; const waitW = new Promise((r) => (releaseW = r));
+    let midText = "";
+    scriptTask([
+      typeStep("black Nike shoes"),
+      (c) => { midText = ["proposal-banner", "proposal-note", "approval-note", "execution-action", "status"].map((k) => ids[k].textContent).join(" | ") + " || " + taskSteps().join(" | "); return { action: "click", target_id: idOf(c, "Search", "button") }; },
+      doneStep("The results for black Nike shoes are showing."),
+    ]);
+    gate = { func: "performApprovedAction", nth: 1, reached: reachedW, wait: waitW };
+    startNoWait(searchGoal);
+    await reachedWP; // step 1 is about to be dispatched
+    const duringRun = ["proposal-banner", "proposal-note", "approval-note", "status"].map((k) => ids[k].textContent).join(" | ");
+    ok("G: while a task step is being run the panel says it is a task step approved by Start, not a proposal waiting for Approve", /task step/i.test(duringRun) && !/press Approve|Proposal only|Nothing has been clicked/i.test(duringRun) && ids["approve-button"].hidden === true, duringRun);
+    releaseW(); gate = null;
+    await taskIdle();
+    ok("G: after a step has run, the next round's panel text does not claim nothing was clicked or ask for Approve, and the step line says executed", !/Nothing has been clicked|press Approve|Proposal only/i.test(midText) && /1\. executed:/.test(midText), midText);
+    ok("G: the final state is distinct from the step lines: finished, with executed steps listed as executed", /^Finished\./.test(taskResult()) && taskSteps().every((x) => /^\d+\. executed:/.test(x)), taskResult());
+
     // ---- source-level guarantees ----
     const sp = fs.readFileSync(path.join(root, "sidepanel.js"), "utf8");
     const spCode = sp.replace(/\/\/.*$/gm, "");
     const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
     ok("C: no new permissions (manifest unchanged: scripting/activeTab/sidePanel; same hosts)", JSON.stringify(manifest.permissions) === '["sidePanel","activeTab","scripting"]' && JSON.stringify(manifest.host_permissions) === '["http://localhost:11434/*","https://*/*","http://*/*"]' && !manifest.content_scripts && !manifest.optional_permissions);
-    ok("C: only executor.js can click/type/scroll; the panel never does", !/\.click\(|\.focus\(|execCommand|insertText|scrollBy\(|scrollTo\(|dispatchEvent|chrome\.debugger|chrome\.tabs\.(update|create|remove|reload)/.test(sp.replace(/\/\/.*$/gm, "")));
+    ok("C: only executor.js can click/type/scroll; the panel never does", !/\.click\(|(?<!taskAnswer)\.focus\(|execCommand|insertText|scrollBy\(|scrollTo\(|dispatchEvent|chrome\.debugger|chrome\.tabs\.(update|create|remove|reload)/.test(sp.replace(/\/\/.*$/gm, "")));
+    ok("C: the task loop adds no executor call of its own: it reuses startApproved (the approved-step path) and suggestOnce (the one model call)", /await startApproved\(approval\)/.test(spCode) && /await suggestOnce\(task\.goal/.test(spCode) && (spCode.match(/executeScript\(/g) || []).length === 3);
+    ok("C: no fixed step cap in the loop (it ends on ask_user/cannot, done, no progress, Stop, tab change)", !/MAX_STEPS|MAX_ACTIONS|stepLimit|steps\.length\s*>=?\s*\d/.test(spCode) && /NO_PROGRESS_LIMIT/.test(spCode));
     ok("C: the only caller of the executor is the approval path, and the executor gets no model text", (spCode.match(/performApprovedAction/g) || []).length === 1 && /func: performApprovedAction/.test(spCode));
     ok("C: after an action the panel never calls the model by itself (the only fetch is inside runRequest)", (spCode.match(/\bfetch\(/g) || []).length === 1);
     ok("C: no automatic chain: runApproved/approveProposal never call suggestNextAction or runRequest", !/runApproved[\s\S]*?(suggestNextAction|runRequest)\(/.test(sp.slice(sp.indexOf("async function runApproved"), sp.indexOf("// Separate mode: never runs for Send or Ask"))));

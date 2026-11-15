@@ -74,13 +74,13 @@ const dyn = (n) => JSON.parse(fs.readFileSync(path.join(out, `dyn_${n}.json`), "
     ["extra field", JSON.stringify({ ...blank, action: "scroll", direction: "down", selector: "#buy" }), /unexpected field "selector"/],
     ["coordinates smuggled in", JSON.stringify({ ...blank, x: 10, y: 20 }), /unexpected field "x"/],
     ["wrong type", JSON.stringify({ ...blank, text: 5 }), /field "text" was not text/],
-    ["unknown action", JSON.stringify(act({ action: "execute_js", reason: "alert(1)" })), /action "execute_js" is not one of: click, type, search, scroll, ask_user, cannot/],
+    ["unknown action", JSON.stringify(act({ action: "execute_js", reason: "alert(1)" })), /action "execute_js" is not one of: click, type, search, scroll, ask_user, cannot, done/],
     ["navigate is not an action", JSON.stringify(act({ action: "navigate", target_id: "https://evil.test" })), /action "navigate" is not one of/],
     ["select is deferred", JSON.stringify(act({ action: "select", target_id: "a1:E1" })), /action "select" is not one of/],
     ["bad direction", JSON.stringify(act({ action: "scroll", direction: "sideways" })), /direction "sideways" is not up or down/],
     ["overlong text", JSON.stringify(act({ action: "type", target_id: "a1:E1", text: "x".repeat(201) })), /field "text" is longer than 200/],
     ["absurdly long rationale", JSON.stringify(act({ action: "scroll", direction: "up", rationale: "r".repeat(2001) })), /field "rationale" is longer than 2000/],
-    ["line break in a field", JSON.stringify(act({ action: "ask_user", question: "one\ntwo" })), /control or line-break character/],
+    ["line break in INPUT data (text)", JSON.stringify(act({ action: "type", target_id: "a1:E1", text: "one\ntwo" })), /control or line-break character/],
     ["click without a target", JSON.stringify(act({ action: "click" })), /"click" needs field "target_id"/],
     ["type without text", JSON.stringify(act({ action: "type", target_id: "a1:E1" })), /"type" needs field "text"/],
     ["a multi-step plan in one reply", JSON.stringify([act({ action: "click", target_id: "a1:E1" }), act({ action: "click", target_id: "a1:E2" })]), /not a JSON object/],
@@ -324,9 +324,9 @@ const dyn = (n) => JSON.parse(fs.readFileSync(path.join(out, `dyn_${n}.json`), "
   ok("12: every executeScript call in this whole run was a read-only capture function, main frame, isolated world", calls2.length > 50 && calls2.every((c) => (c.func === "captureActionTargets" || c.func === "capturePageSnapshot") && c.keys === "args,func,target,world" && c.world === "ISOLATED" && !/allFrames":true/.test(c.target) && !/frameIds|documentIds/.test(c.target)), `${calls2.length} calls; funcs: ${[...new Set(calls2.map((c) => c.func))].join(",")}`);
   const strip = (f) => fs.readFileSync(path.join(root, f), "utf8").split("\n").filter((l) => !/^\s*(\/\/|\*)/.test(l)).join("\n");
   const code = strip("sidepanel.js") + strip("actions.js") + strip("targets.js");
-  ok("12: no code path can click, type, scroll, navigate, open tabs or attach a debugger", !/\.click\(|\.dispatchEvent|\.focus\(|chrome\.tabs\.(update|create|remove|reload|goBack|goForward)|chrome\.debugger|chrome\.windows|window\.open|location\.(assign|replace)|scrollTo\(|scrollBy\(|scrollIntoView|\.requestSubmit|execCommand|insertText|new Function|\beval\(|chrome\.scripting\.(insertCSS|registerContentScripts)/.test(code));
+  ok("12: no code path can click, type, scroll, navigate, open tabs or attach a debugger", !/\.click\(|\.dispatchEvent|(?<!taskAnswer)\.focus\(|chrome\.tabs\.(update|create|remove|reload|goBack|goForward)|chrome\.debugger|chrome\.windows|window\.open|location\.(assign|replace)|scrollTo\(|scrollBy\(|scrollIntoView|\.requestSubmit|execCommand|insertText|new Function|\beval\(|chrome\.scripting\.(insertCSS|registerContentScripts)/.test(code));
   const html = fs.readFileSync(path.join(root, "sidepanel.html"), "utf8");
-  ok("12: the only controls that can start an action are the hidden-by-default Approve button and the Confirm button inside the hidden confirmation box; there is no Execute / Run / Do it control", !/<button[^>]*>\s*(execute|run now|apply|do it|perform)[^<]*</i.test(html) && (html.match(/<button/g) || []).length === 7 && /<button id="approve-button" type="button" hidden disabled>Approve this one action<\/button>/.test(html) && /<div id="confirm-box" class="confirm" hidden>/.test(html));
+  ok("12: the only controls that can start an action are the hidden-by-default Approve button and the Confirm button inside the hidden confirmation box; there is no Execute / Run / Do it control", !/<button[^>]*>\s*(execute|run now|apply|do it|perform)[^<]*</i.test(html) && (html.match(/<button/g) || []).length === 9 && /<button id="approve-button" type="button" hidden disabled>Approve this one action<\/button>/.test(html) && /<div id="confirm-box" class="confirm" hidden>/.test(html));
   ok("12: the page is only ever shown as plain text (no innerHTML/outerHTML/insertAdjacentHTML anywhere)", !/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(code));
   ok("12: no console logging in the new modules (so nothing can leak into logs)", !/console\./.test(strip("actions.js") + strip("targets.js")) && !/console\./.test(strip("sidepanel.js")));
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));

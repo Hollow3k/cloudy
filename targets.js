@@ -62,6 +62,7 @@ function captureActionTargets(limits) {
   // so "Passenger name" is not mistaken for a password field.
   const SENSITIVE_TEXT_RE = /\b(pass(word|wd|code|phrase)?|pwd|otp|one[- ]?time|2fa|mfa|cvv|cvc|csc|security code|verification code|auth(entication)? code|card (number|no)|credit card|debit card|cc[- ]?(num|number|exp|csc)|expir(y|ation)|ssn|social security|secret|token|api[- ]?key|pin)\b/i;
   const SEARCH_ATTR_RE = /search|query|\bfind\b|lookup|^q$|^s$/i;
+  const SUBMIT_CANDIDATES = 'button, [role="button"], a[href], input[type="submit"], input[type="button"], input[type="image"]';
   const SEARCH_BUTTON_RE = /search|\bfind\b|lookup|look up|magnif|^go$/i;
   const SENSITIVE_AUTOCOMPLETE = /(^|\s)(cc-[a-z-]+|current-password|new-password|one-time-code)(\s|$)/i;
 
@@ -369,10 +370,48 @@ function captureActionTargets(limits) {
       return { via: "form", reason: "", submit: null, formKey };
     }
     const scope = el.closest('[role="search"], search');
-    if (!scope) return no("none", "it is not inside a form or a search landmark");
+    if (!scope) {
+      // No form and no search landmark. Look in a small local container around the field for ONE enabled,
+      // rendered control whose own accessible label says search/find. Nothing is guessed from position,
+      // an unlabelled icon is never chosen, and several candidates mean "ambiguous".
+      let node = el.parentElement;
+      let sawDisabled = false;
+      for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+        const tag = node.localName;
+        if (tag === "body" || tag === "html" || tag === "main" || tag === "form") break;
+        const all = Array.from(node.querySelectorAll(SUBMIT_CANDIDATES));
+        if (all.length > 25) break; // too broad to be "around the field"
+        const labelled = all.filter((c) => c !== el && classify(c) !== null && isRendered(c) && SEARCH_BUTTON_RE.test(accessibleName(c, classify(c).kind, c.type || "").name));
+        const enabled = labelled.filter((c) => !isDisabledEl(c));
+        if (enabled.length === 1) return asControl(enabled[0], 0);
+        if (enabled.length > 1) return no("ambiguous", "several controls around the field are labelled like a search button");
+        if (labelled.length > 0) sawDisabled = true;
+      }
+      return no("none", sawDisabled
+        ? "a search button is labelled next to it but is disabled (it may enable after typing)"
+        : "no search form, search area or uniquely labelled search control was found around it");
+    }
     const buttons = Array.from(scope.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], input[type="image"]'))
       .filter((c) => !isDisabledEl(c) && isRendered(c) && SEARCH_BUTTON_RE.test(accessibleName(c, "button", c.type || "").name));
     return buttons.length === 1 ? asControl(buttons[0], 0) : no(buttons.length > 1 ? "ambiguous" : "none", buttons.length > 1 ? "several controls in the search area could be the search button" : "no search button was found in the search area");
+  }
+
+  // Visible text from the SAME card as a link or button (for example a video's channel name and view count),
+  // so "the MrBeast video" can be matched when the link itself only carries the title. It is the nearest ancestor
+  // (at most 5 levels up) that adds text beyond the control's own name. It stops at landmarks and lists, and gives
+  // up when an ancestor holds more than 8 links or buttons (that would be several cards, which are never merged).
+  function cardContext(el, name) {
+    const maxChars = limits.contextMax || 80;
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+      const tag = node.localName;
+      if (["body", "html", "main", "nav", "header", "footer", "aside", "form", "ul", "ol", "table", "section"].includes(tag)) return "";
+      if (node.querySelectorAll("a[href], button, [role='button'], [role='link']").length > 8) return "";
+      const text = safeText(node, 400).replace(/\s+/g, " ").trim();
+      const rest = (name !== "" ? text.split(name).join(" ") : text).replace(/\s+/g, " ").trim();
+      if (rest.length >= 3) return clip(rest, maxChars);
+    }
+    return "";
   }
 
   // Everything the panel is told about one listed control. Values only for ordinary fields (see the header).
@@ -393,6 +432,7 @@ function captureActionTargets(limits) {
         SENSITIVE_TEXT_RE.test(el.getAttribute("placeholder") || "") ||
         SENSITIVE_TEXT_RE.test(el.getAttribute("title") || ""));
     const region = regionOf(el);
+    const context = (kind === "link" || kind === "button") && region !== "navigation" && region !== "banner" && region !== "footer" && region !== "sidebar" ? cardContext(el, name) : "";
     const viewport = viewportStatus(el);
     const rect = rectOf(el);
     const destHash = kind === "link" && el.href ? hash(String(el.href)) : "";
@@ -423,7 +463,7 @@ function captureActionTargets(limits) {
     const search = kind === "text-field" && !sensitive && isSearchField(el, cls, name)
       ? { field: true, ...resolveSubmission(el) }
       : null;
-    return { kind, inputType: cls.inputType || "", name, nameSource: source, disabled, readOnly, submit: !!cls.submit, sensitive, viewport, rect, region, signature, value, valueLen, valueWithheld, checked, selected, search };
+    return { kind, inputType: cls.inputType || "", name, context, nameSource: source, disabled, readOnly, submit: !!cls.submit, sensitive, viewport, rect, region, signature, value, valueLen, valueWithheld, checked, selected, search };
   }
 
   // The same description for one element, computed NOW (null when it is no longer a listed,

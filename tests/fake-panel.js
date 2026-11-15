@@ -16,12 +16,13 @@ class FakeEl {
   set textContent(v) { this._text = String(v); this.children = []; }
   appendChild(c) { this.children.push(c); return c; }
   setAttribute() {}
+  focus() {}
   addEventListener(e, f) { this.listeners[e] = f; }
   fire(e, ev) { return this.listeners[e](ev); }
   walk(fn) { fn(this); this.children.forEach((c) => c.walk(fn)); }
 }
 
-const ELEMENT_IDS = ["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "access-state", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings", "suggest-button", "proposal-section", "proposal-banner", "proposal-action", "proposal-rationale", "proposal-checks", "proposal-warnings", "proposal-coverage", "proposal-note", "targets-details", "targets-text", "raw-reply-details", "raw-reply-text", "approve-button", "approval-note", "confirm-box", "confirm-operation", "confirm-reason", "confirm-known", "confirm-unknown", "confirm-button", "cancel-confirm-button", "live-capture", "execution-section", "execution-action", "execution-status", "execution-effect", "execution-goal", "execution-page", "after-details", "after-text"];
+const ELEMENT_IDS = ["prompt-form", "prompt-input", "send-button", "stop-button", "ask-page-button", "status", "reply", "page-info", "access-state", "excerpt-details", "excerpt", "sources-section", "sources-note", "entries-heading", "entries-list", "other-sources-heading", "sources-list", "sources-warnings", "suggest-button", "proposal-section", "proposal-banner", "proposal-action", "proposal-rationale", "proposal-checks", "proposal-warnings", "proposal-coverage", "proposal-note", "targets-details", "targets-text", "raw-reply-details", "raw-reply-text", "start-button", "task-answer-box", "task-question", "task-answer", "task-continue", "task-section", "task-goal", "task-steps", "task-result", "approve-button", "approval-note", "confirm-box", "confirm-operation", "confirm-reason", "confirm-known", "confirm-unknown", "confirm-button", "cancel-confirm-button", "live-capture", "execution-section", "execution-action", "execution-status", "execution-effect", "execution-goal", "execution-page", "after-details", "after-text"];
 
 function load(options = {}) {
   const ids = {};
@@ -29,7 +30,7 @@ function load(options = {}) {
   global.document = { getElementById: (i) => ids[i] || (ids[i] = new FakeEl(i)), createElement: (t) => new FakeEl(t) };
   Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async () => {} } }, configurable: true });
   const handlers = {};
-  ["approve-button", "confirm-box", "execution-section", "after-details"].forEach((i) => (ids[i].hidden = true));
+  ["approve-button", "confirm-box", "execution-section", "after-details", "task-section", "task-answer-box"].forEach((i) => (ids[i].hidden = true));
   let tabQueue = [];
   let scriptImpl = () => [];
   let tabFn = null; // optional: compute the active tab at each query
@@ -46,10 +47,10 @@ function load(options = {}) {
   const realST = setTimeout;
   if (!options.live) global.setTimeout = (f, ms) => (ms === 180000 ? realST(f, 120) : ms === 450 || ms === 350 ? realST(f, 5) : realST(f, ms));
 
-  const names = "confirmProposal,cancelConfirmation,scheduleAutoCapture,runAutoCapture,searchPlan,sameSearchPath,consequenceInfo,goalAsksToSearch,approveProposal,executionEligibility,scrollPlan,performApprovedAction,assessActiveTab,refreshAccessState,showAccessState,getReadableTab,captureActionContext,evaluateActionReply,renderProposal,ACTION_SCHEMA,ACTION_SYSTEM_PROMPT,ACTION_NAMES,TARGET_LIMITS,ACTION_TARGET_BUDGET_CHARS,validateActionReply,parseActionReply,normalizeTargetCapture,buildActionRecords,packTargets,buildActionPrompt,describeProposal,ID_PATTERN,MAX_CITED,MAX_REPLY_IDS,parseStructuredReply,resolveCitations,renderSources,buildEvidence,buildPagePrompt,normalizeSnapshot,runRequest,REPLY_SCHEMA,PAGE_SYSTEM_PROMPT,MODEL,OLLAMA_URL,SNAPSHOT_BUDGET_CHARS,TIMEOUT_MS,MAX_QUESTION_CHARS".split(",");
+  const names = "startTask,isTypeOnlyGoal,confirmProposal,cancelConfirmation,scheduleAutoCapture,runAutoCapture,searchPlan,sameSearchPath,consequenceInfo,goalAsksToSearch,approveProposal,executionEligibility,scrollPlan,performApprovedAction,assessActiveTab,refreshAccessState,showAccessState,getReadableTab,captureActionContext,evaluateActionReply,renderProposal,ACTION_SCHEMA,ACTION_SYSTEM_PROMPT,ACTION_NAMES,TARGET_LIMITS,ACTION_TARGET_BUDGET_CHARS,validateActionReply,parseActionReply,normalizeTargetCapture,buildActionRecords,packTargets,buildActionPrompt,describeProposal,ID_PATTERN,MAX_CITED,MAX_REPLY_IDS,parseStructuredReply,resolveCitations,renderSources,buildEvidence,buildPagePrompt,normalizeSnapshot,runRequest,REPLY_SCHEMA,PAGE_SYSTEM_PROMPT,MODEL,OLLAMA_URL,SNAPSHOT_BUDGET_CHARS,TIMEOUT_MS,MAX_QUESTION_CHARS".split(",");
   const src = fs.readFileSync(process.env.SIDEPANEL_SRC || path.join(root, "sidepanel.js"), "utf8").replace(/^const /gm, "var ").replace(/^let /gm, "var ");
   const actionsSrc = fs.readFileSync(process.env.ACTIONS_SRC || path.join(root, "actions.js"), "utf8").replace(/^const /gm, "var ").replace(/^let /gm, "var ");
-  const factory = new Function("capturePageSnapshot", "captureActionTargets", "performApprovedAction", actionsSrc + "\n" + src + `\nreturn { ${names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}, getPageContext: () => pageContext, getSnapshotCounter: () => snapshotCounter, getActionContext: () => actionContext, setActionContext: (c) => { actionContext = c; }, getActionCounter: () => actionCounter, getPendingApproval: () => pendingApproval, getInFlight: () => inFlight, getLiveCapture: () => liveCapture, getAutoSeq: () => autoSeq, getActiveExecution: () => activeExecution };`);
+  const factory = new Function("capturePageSnapshot", "captureActionTargets", "performApprovedAction", actionsSrc + "\n" + src + `\nreturn { ${names.map((n) => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}, getPageContext: () => pageContext, getSnapshotCounter: () => snapshotCounter, getActionContext: () => actionContext, setActionContext: (c) => { actionContext = c; }, getActionCounter: () => actionCounter, getPendingApproval: () => pendingApproval, getInFlight: () => inFlight, getActiveTask: () => activeTask, getLiveCapture: () => liveCapture, getAutoSeq: () => autoSeq, getActiveExecution: () => activeExecution };`);
   const capFn = new Function(fs.readFileSync(path.join(root, "capture.js"), "utf8") + "\nreturn capturePageSnapshot;")();
   const tgtFn = new Function(fs.readFileSync(process.env.TARGETS_SRC || path.join(root, "targets.js"), "utf8") + "\nreturn captureActionTargets;")();
   const exeFn = new Function(fs.readFileSync(process.env.EXECUTOR_SRC || path.join(root, "executor.js"), "utf8") + "\nreturn performApprovedAction;")();

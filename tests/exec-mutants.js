@@ -18,18 +18,18 @@ const MUTANTS = [
   // (The busy/active-execution guard is a second line of defence, so both are removed here.)
   ["panel: approval consumed AFTER the awaits and no busy guard (double click would run twice)", "SIDEPANEL_SRC", () => {
     let s = once(sp, "  approval.consumed = true;\n  pendingApproval = null;\n", "");
-    s = once(s, "if (!approval || approval.consumed || inFlight || activeExecution) return;", "if (!approval) return;");
+    s = once(s, "if (!approval || approval.consumed || inFlight || activeExecution || activeTask) return;", "if (!approval) return;");
     return once(s, "  let result;\n  try {\n    result = await runApproved(approval, exec);", "  let result;\n  try {\n    result = await runApproved(approval, exec);\n    approval.consumed = true; pendingApproval = null;");
   }],
   ["panel: target found by signature instead of identity key (would retarget a clone)", "SIDEPANEL_SRC", () => once(sp, "norm.targets.find((t) => t.key === a.key)", "norm.targets.find((t) => t.signature === a.signature)")],
-  ["panel: page-wide fingerprint check removed", "SIDEPANEL_SRC", () => once(sp, "if (norm.fingerprint !== a.fingerprint || norm.targets.length !== a.controlCount) {", "if (false) {")],
+  ["panel: page-wide fingerprint check removed", "SIDEPANEL_SRC", () => once(sp, "if (!a.loose && (norm.fingerprint !== a.fingerprint || norm.targets.length !== a.controlCount)) {", "if (false) {")],
   ["panel: scroll feasibility not rechecked at dispatch time", "SIDEPANEL_SRC", () => once(sp, "if (!plan.ok) return refusal(\"Not done: this scroll is not possible.\"", "if (false) return refusal(\"Not done: this scroll is not possible.\"")],
   // (There are three cancellation checks, the last one right before the dispatch; all are removed.)
   ["panel: Stop does not cancel before dispatch", "SIDEPANEL_SRC", () => sp.replaceAll("if (exec.cancelled) return cancelledResult(exec);", "")],
   ["panel: document token not compared", "SIDEPANEL_SRC", () => once(sp, "if (norm.documentToken !== a.documentToken) return refusal", "if (false) return refusal")],
   ["panel: rules not applied again to the fresh control", "SIDEPANEL_SRC", () => once(sp, "if (check.kind !== \"valid\") {", "if (false) {")],
   ["panel: typing result claims verification instead of reporting the new capture", "SIDEPANEL_SRC", () => once(sp, "nothing was submitted. ${observeFieldValue(a, after)}", "nothing was submitted. The text was typed and verified in the field.")],
-  ["executor: signature not compared", "EXECUTOR_SRC", () => once(ex, "cur.signature !== spec.signature || cur.kind !== spec.kind", "false")],
+  ["executor: signature not compared", "EXECUTOR_SRC", () => once(ex, ": c.signature === spec.signature && c.kind === spec.kind;", ": c.kind === spec.kind;")],
   ["executor: credential-looking check removed", "EXECUTOR_SRC", () => once(ex, "if (cur.sensitive) return fail(", "if (false) return fail(")],
   ["executor: scroll does not check remaining distance", "EXECUTOR_SRC", () => once(ex, "if (!(remaining >= 1)) {", "if (false) {")],
   ["executor: offscreen controls are acted on", "EXECUTOR_SRC", () => once(ex, "if (cur.viewport !== \"in-view\" && cur.viewport !== \"partly-in-view\") {", "if (false) {")],
@@ -37,7 +37,7 @@ const MUTANTS = [
   // ---- Search, confirmation, scroll validity (added with the Search operation) ----
   ["executor: the search box's initial content is not compared", "EXECUTOR_SRC", () => once(ex, 'if (typeof spec.initialValue !== "string" || before !== spec.initialValue) {', "if (false) {")],
   ["executor: the field is not checked against the expected NEW state after filling", "EXECUTOR_SRC", () => once(ex, "if (el.value !== spec.text) {", "if (false) {")],
-  ["executor: the page is not looked at again after filling", "EXECUTOR_SRC", () => once(ex, "if (now === null || now.signature !== spec.signature || !samePath(now.search)) {", "if (false) {")],
+  ["executor: the page is not looked at again after filling", "EXECUTOR_SRC", () => once(ex, "if (now === null || !sameTarget(now) || !samePath(now.search)) {", "if (false) {")],
   ["executor: form.submit() instead of requestSubmit() (skips validation and the submit event)", "EXECUTOR_SRC", () => once(ex, "else second.form.requestSubmit();", "else second.form.submit();")],
   ["executor: always retypes, even when the box already holds exactly the query", "EXECUTOR_SRC", () => once(ex, "if (before === spec.text) {", "if (false) {")],
   ["panel: a consequential control runs straight from Approve (no confirmation step)", "SIDEPANEL_SRC", () => once(sp, "if (approval.confirm && !approval.confirmed) {", "if (false) {")],
@@ -54,8 +54,29 @@ const MUTANTS = [
   }, "operations.test.js"],
   ["panel: closing the panel does not stop automatic capture", "SIDEPANEL_SRC", () => once(sp, 'window.addEventListener("pagehide", () => {', 'window.addEventListener("pagehide", () => { return;'), "operations.test.js"],
   ["panel: events from inactive tabs trigger a capture", "SIDEPANEL_SRC", () => once(sp, "&& !(tabInfo && tabInfo.active === false)", ""), "operations.test.js"],
-  ["panel: automatic capture runs while a request is in flight", "SIDEPANEL_SRC", () => once(sp, "  if (inFlight) {\n    autoPending = true; // do not interleave with a model request or an approved action\n    return;\n  }\n", ""), "operations.test.js"],
+  ["panel: automatic capture runs while a request is in flight", "SIDEPANEL_SRC", () => once(sp, "  if (inFlight || activeTask) {\n    autoPending = true; // do not interleave with a model request or an approved action\n    return;\n  }\n", ""), "operations.test.js"],
   ["actions: a value is kept for a flagged (secret) field", "ACTIONS_SRC", () => once(ac, "if (textish && !sensitive) {", "if (textish) {"), "targets.test.js"],
+  // ---- the task loop (added with Start) ----
+  ["task: Stop/late replies are not checked (cancel checks removed)", "SIDEPANEL_SRC", () => sp.replaceAll("if (task.cancelled) return cancelled();", "")],
+  ["task: 'done' is believed without observed evidence", "SIDEPANEL_SRC", () => once(sp, "if (searching ? task.resultsObserved : task.evidence.length > 0) {", "if (true) {")],
+  ["task: a Type-only goal does not stop after the verified text", "SIDEPANEL_SRC", () => once(sp, 'if (approval.action === "type" && isTypeOnlyGoal(task.goal) && fieldHolds(approval, res.after)) {', "if (false) {")],
+  ["task: the no-progress limit is raised to 3", "SIDEPANEL_SRC", () => once(sp, "const NO_PROGRESS_LIMIT = 2;", "const NO_PROGRESS_LIMIT = 3;")],
+  ["task: a repeated step that changed nothing is run again", "SIDEPANEL_SRC", () => once(sp, "if (task.noChange.has(key)) {", "if (false) {")],
+  ["task: the consequential confirmation pause is skipped", "SIDEPANEL_SRC", () => once(sp, "    if (approval.confirm) {\n      // The existing pause", "    if (false) {\n      // The existing pause")],
+  ["task: switching tabs does not end the task", "SIDEPANEL_SRC", () => once(sp, 'if (activeTask && (activeTask.tabId === null || tabId !== activeTask.tabId)) cancelTask("you switched tabs");', "")],
+  ["task: any changed state counts as progress (no 'seen before' check)", "SIDEPANEL_SRC", () => once(sp, "const progress = !task.sigs.has(sigAfter);", "const progress = true;")],
+  // ---- multi-step fixes: waiting for an answer, recovery vs no progress, loose freshness, search discovery ----
+  ["task: after an answer the page/tab is not re-checked (it would act on another page)", "SIDEPANEL_SRC", () => once(sp, "const changed = await checkSamePageAfterWait(task);", 'const changed = "";')],
+  ["task: the document token is not compared after the wait", "SIDEPANEL_SRC", () => once(sp, "if (norm.documentToken !== task.waitDoc.documentToken) return", "if (false) return")],
+  ["task: ask_user ends the task instead of waiting", "SIDEPANEL_SRC", () => once(sp, "const answer = await waitForAnswer(task, p.question);", 'return stop("the model needs you");')],
+  ["task: Stop does not end a wait for an answer", "SIDEPANEL_SRC", () => once(sp, "  resolveTaskAnswer(task, null); // also ends a wait for the person's answer\n", "")],
+  ["task: the person's answers are not given to the model", "SIDEPANEL_SRC", () => once(sp, "await suggestOnce(task.goal, taskHistory(task), taskAnswers(task));", "await suggestOnce(task.goal, taskHistory(task), []);")],
+  ["task: a rejected/not-run round counts as no progress (the old behaviour)", "SIDEPANEL_SRC", () => once(sp, "    task.recoveries++;\n    return task.recoveries >= RECOVERY_LIMIT;", "    task.noProgress++;\n    return task.noProgress >= NO_PROGRESS_LIMIT;")],
+  ["task: permission-style questions always go to the person", "SIDEPANEL_SRC", () => once(sp, "if (isRoutineQuestion(p.question) && task.bounces < PERMISSION_BOUNCE_LIMIT) {", "if (false) {")],
+  ["task: the recovery limit is raised to 30", "SIDEPANEL_SRC", () => once(sp, "const RECOVERY_LIMIT = 3;", "const RECOVERY_LIMIT = 30;")],
+  ["panel: in a task the whole-page check is used (the YouTube-style staleness)", "SIDEPANEL_SRC", () => once(sp, "loose: !!activeTask };", "loose: false };")],
+  ["panel: in a task a renamed/removed control is not refused (identity/state not compared)", "SIDEPANEL_SRC", () => once(sp, "const unchanged = a.loose ? sameControl(current, a) : current.signature === a.signature;", "const unchanged = true;")],
+  ["actions: a reason over 300 characters is rejected again", "ACTIONS_SRC", () => once(ac, "const ACTION_FIELD_MAX = { target_id: 40, text: 200 };", "const ACTION_FIELD_MAX = { target_id: 40, text: 200, rationale: 300 };")],
 ];
 
 const only = process.env.ONLY ? Number(process.env.ONLY) : null;

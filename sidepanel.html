@@ -26,12 +26,19 @@
           <button type="button" id="ask-page-button">Ask about this page</button>
           <button type="button" id="suggest-button">Suggest next action</button>
         </div>
+        <div class="buttons">
+          <button type="button" id="start-button">Start task</button>
+        </div>
         <p class="hint">
           Send is plain chat. "Ask about this page" reads the active tab and answers a
           question. "Suggest next action" reads the tab's controls and proposes ONE step
           toward the goal you typed. Nothing is clicked, typed, submitted or scrolled unless you
           press Approve on that one proposal. A search is one operation: one approval fills
-          and submits it.
+          and submits it. "Start task" is ONE approval for the whole goal: Cloudy then reads
+          the page, takes one step, reads it again and chooses the next, without asking again
+          for routine steps. It pauses for a separate confirmation on a consequential-looking
+          control, and stops when it needs you, cannot continue, makes no progress, or you
+          press Stop (Stop cannot undo steps already taken).
         </p>
       </form>
 
@@ -89,6 +96,19 @@
           <button id="confirm-button" type="button" disabled>Yes, run this step once</button>
           <button id="cancel-confirm-button" type="button">Cancel</button>
         </div>
+      </section>
+
+      <section id="task-section" class="execution" aria-labelledby="task-heading" hidden>
+        <h2 id="task-heading">Task</h2>
+        <p id="task-goal"></p>
+        <ul id="task-steps"></ul>
+        <div id="task-answer-box" hidden>
+          <p id="task-question"></p>
+          <label for="task-answer">Your answer</label>
+          <textarea id="task-answer" rows="2" placeholder="Type your answer, then Continue"></textarea>
+          <button id="task-continue" type="button">Continue</button>
+        </div>
+        <p id="task-result" role="status" aria-live="polite"></p>
       </section>
 
       <section id="execution-section" class="execution" aria-labelledby="execution-heading" hidden>
